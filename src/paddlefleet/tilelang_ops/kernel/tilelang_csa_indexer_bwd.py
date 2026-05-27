@@ -181,32 +181,6 @@ def tl_csa_indexer_bwd_impl(
     return tl_csa_indexer_bwd_kernel
 
 
-def _next_power_of_2(x: int) -> int:
-    if x <= 1:
-        return 1
-    return 1 << (x - 1).bit_length()
-
-
-def _zeros_like(tensor, dtype=None):
-    return paddle.zeros_like(tensor, dtype=dtype)
-
-
-def _empty_like(tensor, dtype=None):
-    return paddle.empty_like(tensor, dtype=dtype)
-
-
-def _full(shape, fill_value, dtype):
-    return paddle.full(shape, fill_value, dtype=dtype)
-
-
-def _zeros(shape, dtype):
-    return paddle.zeros(shape, dtype=dtype)
-
-
-def _concat(tensors, axis):
-    return paddle.concat(tensors, axis=axis)
-
-
 def csa_indexer_bwd_interface(
     index_q,
     weights,
@@ -255,24 +229,24 @@ def csa_indexer_bwd_interface(
     assert topk_effective == topk_g
     assert topk_effective > 0
 
-    padded_topk = _next_power_of_2(topk_effective)
+    padded_topk = 1 << (topk_effective - 1).bit_length()
     if padded_topk % block_I != 0:
         padded_topk = ((padded_topk + block_I - 1) // block_I) * block_I
-        padded_topk = _next_power_of_2(padded_topk)
+        padded_topk = 1 << (padded_topk - 1).bit_length()
 
     if padded_topk != topk_effective:
         pad = padded_topk - topk_effective
-        topk_pad = _full(
+        topk_pad = paddle.full(
             [batch, seq_len, pad],
             -1,
             topk_indices.dtype,
         )
-        grad_pad = _zeros(
+        grad_pad = paddle.zeros(
             [batch, seq_len, pad],
             grad_scores.dtype,
         )
-        topk_indices = _concat([topk_indices, topk_pad], axis=-1).contiguous()
-        grad_scores = _concat([grad_scores, grad_pad], axis=-1).contiguous()
+        topk_indices = paddle.concat([topk_indices, topk_pad], axis=-1).contiguous()
+        grad_scores = paddle.concat([grad_scores, grad_pad], axis=-1).contiguous()
 
     kernel = tl_csa_indexer_bwd_impl(
         heads=heads,
@@ -284,9 +258,9 @@ def csa_indexer_bwd_interface(
         num_threads=num_threads,
     )
 
-    grad_q = _empty_like(index_q)
-    grad_weights = _empty_like(weights, dtype="float32")
-    grad_k_comp = _zeros_like(index_k_comp, dtype="float32")
+    grad_q = paddle.empty_like(index_q)
+    grad_weights = paddle.empty_like(weights, dtype="float32")
+    grad_k_comp = paddle.zeros_like(index_k_comp, dtype="float32")
 
     kernel(
         index_q,
