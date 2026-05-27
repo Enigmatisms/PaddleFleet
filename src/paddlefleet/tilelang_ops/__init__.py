@@ -3,6 +3,7 @@ import paddle
 paddle.enable_compat(scope={"tilelang"}, silent=True)
 
 __all__ = [
+    "tilelang_csa_attn_target_reducesum_paddle",
     "tilelang_csa_compressed_indexer_bwd_paddle",
     "tilelang_csa_compressed_indexer_topk_paddle",
 ]
@@ -10,15 +11,18 @@ __all__ = [
 
 def __getattr__(name):
     if name in {
+        "tilelang_csa_attn_target_reducesum_paddle",
         "tilelang_csa_compressed_indexer_bwd_paddle",
         "tilelang_csa_compressed_indexer_topk_paddle",
     }:
         from .csa_indexer_core import (
+            tilelang_csa_attn_target_reducesum_paddle,
             tilelang_csa_compressed_indexer_bwd_paddle,
             tilelang_csa_compressed_indexer_topk_paddle,
         )
 
         exports = {
+            "tilelang_csa_attn_target_reducesum_paddle": tilelang_csa_attn_target_reducesum_paddle,
             "tilelang_csa_compressed_indexer_bwd_paddle": tilelang_csa_compressed_indexer_bwd_paddle,
             "tilelang_csa_compressed_indexer_topk_paddle": tilelang_csa_compressed_indexer_topk_paddle,
         }

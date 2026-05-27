@@ -386,6 +386,17 @@ class TestTileLangCSAIndexerLossGrad(unittest.TestCase):
         dw_bf = w_sf.grad.transpose([1, 0, 2]) * alpha
         return loss, dq_bf, dw_bf, dk_bf
 
+    def test_attn_target_reducesum_matches_paddle(self):
+        from paddlefleet.tilelang_ops import tilelang_csa_attn_target_reducesum_paddle
+        from paddlefleet.transformer.csa_attention import _compute_attn_target_on_selected_set
+        q, k, w, qm, km = self._common_inputs(seed=2032)
+        topk_eff = 2; softmax_scale = self.HN ** -0.5
+        from paddlefleet.tilelang_ops import tilelang_csa_compressed_indexer_topk_paddle
+        topk_indices, _ = tilelang_csa_compressed_indexer_topk_paddle(q, k, w, ratio=self.RATIO, topk_effective=topk_eff)
+        tl_target = tilelang_csa_attn_target_reducesum_paddle(qm, km, topk_indices, softmax_scale)
+        pd_target = _compute_attn_target_on_selected_set(qm, km, topk_indices, softmax_scale, None)
+        _assert_close(tl_target, pd_target, rtol=6e-2, atol=2e-2, msg="attention target mismatch")
+
     def test_phase3_selected_topk_grad(self):
         q, k, w, qm, km = self._common_inputs()
         topk_eff = 2; softmax_scale = self.HN ** -0.5

@@ -56,6 +56,12 @@ def _get_csa_indexer_bwd_interface():
     return csa_indexer_bwd_interface
 
 
+def _get_csa_attn_target_reducesum_interface():
+    from .kernel.tilelang_csa_attn_target import csa_attn_target_reducesum_interface
+
+    return csa_attn_target_reducesum_interface
+
+
 def _contiguous(tensor):
     return tensor.contiguous()
 
@@ -191,6 +197,70 @@ def tilelang_csa_compressed_indexer_topk_paddle(
             "Ensure paddle.enable_compat(scope={'tilelang'}) runs before import tilelang."
         )
     return topk_indices, topk_scores
+
+
+def tilelang_csa_attn_target_reducesum_paddle(
+    query_mla,
+    key_comp_mla,
+    topk_indices,
+    softmax_scale: float,
+    block_I: int = DEFAULT_INDEXER_BLOCK,
+    num_stages: int = 0,
+    num_threads: int = 128,
+):
+    """Paddle entry for V4 CSA indexer-loss attention target computation.
+
+    Computes the selected-set multi-head target distribution used by the CSA
+    indexer KL loss. This replaces materializing full [B, H, S, S_comp]
+    attention scores in the Paddle reference path.
+    """
+    if not isinstance(query_mla, paddle.Tensor):
+        raise TypeError(f"query_mla must be a paddle.Tensor, got {type(query_mla)!r}")
+    if not isinstance(key_comp_mla, paddle.Tensor):
+        raise TypeError(f"key_comp_mla must be a paddle.Tensor, got {type(key_comp_mla)!r}")
+    if not isinstance(topk_indices, paddle.Tensor):
+        raise TypeError(f"topk_indices must be a paddle.Tensor, got {type(topk_indices)!r}")
+    if len(query_mla.shape) != 4:
+        raise ValueError(f"query_mla must have shape [B, S, H, D], got {tuple(query_mla.shape)}")
+    if len(key_comp_mla.shape) != 4:
+        raise ValueError(f"key_comp_mla must have shape [B, S_comp, H, D], got {tuple(key_comp_mla.shape)}")
+    if len(topk_indices.shape) != 3:
+        raise ValueError(f"topk_indices must have shape [B, S, topk], got {tuple(topk_indices.shape)}")
+    if tuple(query_mla.shape)[0] != tuple(key_comp_mla.shape)[0] or tuple(query_mla.shape)[0] != tuple(topk_indices.shape)[0]:
+        raise ValueError(
+            f"batch mismatch: query_mla={tuple(query_mla.shape)}, key_comp_mla={tuple(key_comp_mla.shape)}, topk_indices={tuple(topk_indices.shape)}"
+        )
+    if tuple(query_mla.shape)[1] != tuple(topk_indices.shape)[1]:
+        raise ValueError(
+            f"sequence mismatch: query_mla={tuple(query_mla.shape)}, topk_indices={tuple(topk_indices.shape)}"
+        )
+    if tuple(query_mla.shape)[2:] != tuple(key_comp_mla.shape)[2:]:
+        raise ValueError(
+            f"head/dim mismatch: query_mla={tuple(query_mla.shape)}, key_comp_mla={tuple(key_comp_mla.shape)}"
+        )
+    topk_indices = _contiguous(_cast_int32(topk_indices))
+    csa_attn_target_reducesum_interface = _get_csa_attn_target_reducesum_interface()
+    target = csa_attn_target_reducesum_interface(
+        _contiguous(query_mla),
+        _contiguous(key_comp_mla),
+        topk_indices,
+        float(softmax_scale),
+        block_I=int(block_I),
+        num_stages=int(num_stages),
+        num_threads=int(num_threads),
+    )
+    expected_shape = tuple(topk_indices.shape)
+    if tuple(target.shape) != expected_shape:
+        raise RuntimeError(
+            f"unexpected CSA attention target shape: target={tuple(target.shape)}, expected={expected_shape}"
+        )
+    if not isinstance(target, paddle.Tensor):
+        raise RuntimeError(
+            "TileLang must return Paddle tensors. "
+            "Ensure paddle.enable_compat(scope={'tilelang'}) runs before import tilelang."
+        )
+    return target
+
 
 
 def tilelang_csa_compressed_indexer_bwd_paddle(

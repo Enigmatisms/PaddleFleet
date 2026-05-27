@@ -547,6 +547,7 @@ class TileLangCSAIndexerLoss(paddle.autograd.PyLayer):
         # the selected ``[B,S,topk_effective]`` tensors and backward never
         # touches the full ``[B,S,S_comp]`` logits.
         from paddlefleet.tilelang_ops import (
+            tilelang_csa_attn_target_reducesum_paddle,
             tilelang_csa_compressed_indexer_topk_paddle,
         )
 
@@ -563,9 +564,17 @@ class TileLangCSAIndexerLoss(paddle.autograd.PyLayer):
         TileLangCSAIndexerLoss._last_topk_indices = topk_indices.detach()
         TileLangCSAIndexerLoss._last_topk_probs = topk_probs.detach()
 
-        target = _compute_attn_target_on_selected_set(
-            query_mla, key_comp_mla, topk_indices, softmax_scale, tp_group
-        )  # [b, sq, topk_effective] fp32
+        if tp_group is not None and getattr(tp_group, "nranks", 1) > 1:
+            target = _compute_attn_target_on_selected_set(
+                query_mla, key_comp_mla, topk_indices, softmax_scale, tp_group
+            )
+        else:
+            target = tilelang_csa_attn_target_reducesum_paddle(
+                query_mla,
+                key_comp_mla,
+                topk_indices,
+                softmax_scale,
+            )
 
         # KL(p || q) on selected set; invalid slots have target == 0 so the
         # ``target * log(target / q)`` term contributes 0 by convention.
