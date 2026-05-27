@@ -1,4 +1,17 @@
-# ruff: noqa
+# Copyright (c) 2026 PaddlePaddle Authors. All Rights Reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 # TileLang target-probability kernel for DeepSeek V4 CSA indexer loss.
 
 import paddle
@@ -54,7 +67,10 @@ def tl_csa_attn_target_reducesum(
         SoftmaxScale: T.Tensor([1], FP32),
         PartialReduceSum: T.Tensor(partial_shape, FP32),
     ):
-        with T.Kernel(seq_len * replicate_h, batch, threads=num_threads) as (bx, by):
+        with T.Kernel(seq_len * replicate_h, batch, threads=num_threads) as (
+            bx,
+            by,
+        ):
             s_i = bx if replicate_h == 1 else bx // replicate_h
             r_i = bx % replicate_h
             h_base = 0 if replicate_h == 1 else r_i * 64
@@ -69,6 +85,7 @@ def tl_csa_attn_target_reducesum(
             block_sum = T.alloc_fragment([h_per_block], dtype=FP32)
             reduce_sum = T.alloc_fragment([block_I], dtype=FP32)
 
+            # step 1: load query tile into shared memory
             for h_i, d_i in T.Parallel(h_per_block, dim):
                 query_shared[h_i, d_i] = T.if_then_else(
                     h_base + h_i < heads,
@@ -77,11 +94,16 @@ def tl_csa_attn_target_reducesum(
                 )
             T.sync_threads()
 
+            # step 2: online softmax — compute row_max and row_sum in a single pass
+            # (With external LSE[B,S,H], skip this step; use row_max=LSE, row_sum=1)
             T.fill(row_max, -T.infinity(FP32))
+            T.fill(row_sum, 0)
             num_blocks = T.ceildiv(topk, block_I)
             for block_idx in T.Pipelined(num_blocks, num_stages=num_stages):
                 for i in T.Parallel(block_I):
-                    indices_shared[i] = TopkIndices[by, s_i, block_idx * block_I + i]
+                    indices_shared[i] = TopkIndices[
+                        by, s_i, block_idx * block_I + i
+                    ]
                 T.sync_threads()
 
                 for h_i, i in T.Parallel(h_per_block, block_I):
@@ -92,7 +114,8 @@ def tl_csa_attn_target_reducesum(
                             ((h_base + h_i) < heads)
                             & (indices_shared[i] >= 0)
                             & (indices_shared[i] < seq_len_comp),
-                            query_shared[h_i, d_i] * KeyComp[by, indices_shared[i], h_base + h_i, d_i],
+                            query_shared[h_i, d_i]
+                            * KeyComp[by, indices_shared[i], h_base + h_i, d_i],
                             0,
                         )
                 for h_i, i in T.Parallel(h_per_block, block_I):
@@ -103,44 +126,27 @@ def tl_csa_attn_target_reducesum(
                         logits[h_i, i] * SoftmaxScale[0],
                         -T.infinity(FP32),
                     )
+                # online update: rescale running sum then incorporate new block
                 T.fill(block_max, -T.infinity(FP32))
                 T.reduce_max(logits, block_max, dim=1, clear=False)
                 for h_i in T.Parallel(h_per_block):
-                    row_max[h_i] = T.max(row_max[h_i], block_max[h_i])
-
-            T.fill(row_sum, 0)
-            for block_idx in T.Pipelined(num_blocks, num_stages=num_stages):
-                for i in T.Parallel(block_I):
-                    indices_shared[i] = TopkIndices[by, s_i, block_idx * block_I + i]
-                T.sync_threads()
-
-                for h_i, i in T.Parallel(h_per_block, block_I):
-                    logits[h_i, i] = 0
-                for d_i in T.serial(dim):
-                    for h_i, i in T.Parallel(h_per_block, block_I):
-                        logits[h_i, i] += T.if_then_else(
-                            ((h_base + h_i) < heads)
-                            & (indices_shared[i] >= 0)
-                            & (indices_shared[i] < seq_len_comp),
-                            query_shared[h_i, d_i] * KeyComp[by, indices_shared[i], h_base + h_i, d_i],
-                            0,
-                        )
-                for h_i, i in T.Parallel(h_per_block, block_I):
-                    logits[h_i, i] = T.if_then_else(
-                        ((h_base + h_i) < heads)
-                        & (indices_shared[i] >= 0)
-                        & (indices_shared[i] < seq_len_comp),
-                        T.exp(logits[h_i, i] * SoftmaxScale[0] - row_max[h_i]),
-                        0,
+                    row_sum[h_i] *= T.exp(
+                        row_max[h_i] - T.max(row_max[h_i], block_max[h_i])
                     )
+                    row_max[h_i] = T.max(row_max[h_i], block_max[h_i])
+                for h_i, i in T.Parallel(h_per_block, block_I):
+                    logits[h_i, i] = T.exp(logits[h_i, i] - row_max[h_i])
                 T.fill(block_sum, 0)
                 T.reduce_sum(logits, block_sum, dim=1, clear=False)
                 for h_i in T.Parallel(h_per_block):
                     row_sum[h_i] += block_sum[h_i]
 
+            # step 3: compute normalized probs and reduce over heads
             for block_idx in T.Pipelined(num_blocks, num_stages=num_stages):
                 for i in T.Parallel(block_I):
-                    indices_shared[i] = TopkIndices[by, s_i, block_idx * block_I + i]
+                    indices_shared[i] = TopkIndices[
+                        by, s_i, block_idx * block_I + i
+                    ]
                 T.sync_threads()
 
                 for h_i, i in T.Parallel(h_per_block, block_I):
@@ -151,7 +157,8 @@ def tl_csa_attn_target_reducesum(
                             ((h_base + h_i) < heads)
                             & (indices_shared[i] >= 0)
                             & (indices_shared[i] < seq_len_comp),
-                            query_shared[h_i, d_i] * KeyComp[by, indices_shared[i], h_base + h_i, d_i],
+                            query_shared[h_i, d_i]
+                            * KeyComp[by, indices_shared[i], h_base + h_i, d_i],
                             0,
                         )
                 for h_i, i in T.Parallel(h_per_block, block_I):
@@ -160,14 +167,20 @@ def tl_csa_attn_target_reducesum(
                         & (indices_shared[i] >= 0)
                         & (indices_shared[i] < seq_len_comp)
                         & (row_sum[h_i] > 0),
-                        T.exp(logits[h_i, i] * SoftmaxScale[0] - row_max[h_i]) / row_sum[h_i],
+                        T.exp(logits[h_i, i] * SoftmaxScale[0] - row_max[h_i])
+                        / row_sum[h_i],
                         0,
                     )
                 T.fill(reduce_sum, 0)
                 T.reduce_sum(logits, reduce_sum, dim=0, clear=False)
                 T.copy(
                     reduce_sum,
-                    PartialReduceSum[by, s_i, r_i, block_idx * block_I : block_idx * block_I + block_I],
+                    PartialReduceSum[
+                        by,
+                        s_i,
+                        r_i,
+                        block_idx * block_I : block_idx * block_I + block_I,
+                    ],
                 )
 
     return target_kernel

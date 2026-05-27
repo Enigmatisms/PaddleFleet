@@ -1,4 +1,17 @@
-# ruff: noqa
+# Copyright (c) 2026 PaddlePaddle Authors. All Rights Reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 # TileLang fused forward kernel for DeepSeek V4 CSA compressed indexer.
 #
 # This kernel produces compressed top-k indices and top-k softmax probabilities
@@ -79,8 +92,14 @@ def tl_csa_indexer_topk_fwd_impl(
                     ascending = (i & (1 << (i1 + 1))) != 0
                     j = i ^ (1 << (i1 - i2))
                     if i < j and (
-                        (ascending and topk_value_shared[i] > topk_value_shared[j])
-                        or (not ascending and topk_value_shared[i] < topk_value_shared[j])
+                        (
+                            ascending
+                            and topk_value_shared[i] > topk_value_shared[j]
+                        )
+                        or (
+                            not ascending
+                            and topk_value_shared[i] < topk_value_shared[j]
+                        )
                     ):
                         val = topk_value_shared[i]
                         topk_value_shared[i] = topk_value_shared[j]
@@ -163,7 +182,9 @@ def tl_csa_indexer_topk_fwd_impl(
                     if k_st + i >= valid_end:
                         logits_sum[i] = float("-inf")
                     j = offset + i
-                    topk_index_shared[j] = T.if_then_else(k_st + i < valid_end, k_st + i, -1)
+                    topk_index_shared[j] = T.if_then_else(
+                        k_st + i < valid_end, k_st + i, -1
+                    )
                     topk_value_shared[j] = logits_sum[i]
                 T.sync_threads()
 
@@ -276,12 +297,8 @@ def csa_indexer_topk_fwd_interface(
         num_threads=num_threads,
     )
 
-    topk_indices = paddle.empty(
-        [batch, seq_len, padded_topk], dtype="int32"
-    )
-    topk_scores = paddle.empty(
-        [batch, seq_len, padded_topk], dtype="float32"
-    )
+    topk_indices = paddle.empty([batch, seq_len, padded_topk], dtype="int32")
+    topk_scores = paddle.empty([batch, seq_len, padded_topk], dtype="float32")
 
     kernel(
         index_q,

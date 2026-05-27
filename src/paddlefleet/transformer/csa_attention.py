@@ -387,9 +387,7 @@ def _resolve_csa_indexer_topk_effective(
       selected set covers the full compressed candidate range and is later
       consumed as full-range KL by the indexer loss path.
     """
-    use_sparse_loss = bool(
-        getattr(config, "dsa_indexer_use_sparse_loss", True)
-    )
+    use_sparse_loss = bool(getattr(config, "dsa_indexer_use_sparse_loss", True))
     if use_sparse_loss:
         return min(int(index_topk), int(n_compressed))
     return int(n_compressed)
@@ -410,7 +408,10 @@ def _map_compressed_topk_to_kv_full(
     KV positions inside ``kv_full``).
     """
     n_valid_per_pos = (
-        paddle.arange(1, sq + 1, dtype=topk_indices_compressed.dtype).unsqueeze(1) // ratio
+        paddle.arange(1, sq + 1, dtype=topk_indices_compressed.dtype).unsqueeze(
+            1
+        )
+        // ratio
     ).unsqueeze(0)  # [1, sq, 1]
     valid = topk_indices_compressed < n_valid_per_pos
     return paddle.where(
@@ -420,10 +421,10 @@ def _map_compressed_topk_to_kv_full(
     )
 
 
-def _compute_attn_target_on_selected_set(
-    query_mla: Tensor,        # [b, sq, np, hn]  DETACHED
-    key_comp_mla: Tensor,     # [b, sk, np, hn]  DETACHED (compressed KV expanded per-head)
-    topk_indices: Tensor,     # [b, sq, topk_eff] int32, -1 for invalid slots
+def _compute_attn_target(
+    query_mla: Tensor,  # [b, sq, np, hn]  DETACHED
+    key_comp_mla: Tensor,  # [b, sk, np, hn]  DETACHED (compressed KV expanded per-head)
+    topk_indices: Tensor,  # [b, sq, topk_eff] int32, -1 for invalid slots
     softmax_scale: float,
     tp_group=None,
 ) -> Tensor:
@@ -443,30 +444,28 @@ def _compute_attn_target_on_selected_set(
     topk_eff = topk_indices.shape[-1]
 
     # Per-head full attention scores [b, np, sq, sk]
-    q = query_mla.transpose([0, 2, 1, 3]).cast("float32")          # [b, np, sq, hn]
-    k = key_comp_mla.transpose([0, 2, 3, 1]).cast("float32")       # [b, np, hn, sk]
-    attn_scores = paddle.matmul(q, k) * float(softmax_scale)       # [b, np, sq, sk]
+    q = query_mla.transpose([0, 2, 1, 3]).cast("float32")  # [b, np, sq, hn]
+    k = key_comp_mla.transpose([0, 2, 3, 1]).cast("float32")  # [b, np, hn, sk]
+    attn_scores = paddle.matmul(q, k) * float(softmax_scale)  # [b, np, sq, sk]
 
     # Replace -1 with 0 for safe gather; then mask back to -inf afterwards.
-    valid = topk_indices >= 0                                      # [b, sq, topk_eff]
+    valid = topk_indices >= 0  # [b, sq, topk_eff]
     safe_indices = paddle.where(
         valid, topk_indices, paddle.zeros_like(topk_indices)
     ).cast("int64")
-    safe_indices_exp = safe_indices.unsqueeze(1).expand(
-        [b, np, sq, topk_eff]
-    )
+    safe_indices_exp = safe_indices.unsqueeze(1).expand([b, np, sq, topk_eff])
     selected_logits = paddle.take_along_axis(
         attn_scores, safe_indices_exp, axis=-1
     )  # [b, np, sq, topk_eff]
 
     # Mask invalid slots so softmax assigns them zero probability.
-    valid_bn = valid.unsqueeze(1)                                  # [b, 1, sq, topk_eff]
+    valid_bn = valid.unsqueeze(1)  # [b, 1, sq, topk_eff]
     neg_inf = paddle.full([1], float("-inf"), dtype="float32")
     selected_logits = paddle.where(valid_bn, selected_logits, neg_inf)
 
     # Avoid all-(-inf) rows producing NaN in softmax: zero such rows out.
-    row_valid = valid.any(axis=-1, keepdim=True)                   # [b, sq, 1]
-    row_valid_bn = row_valid.unsqueeze(1)                          # [b, 1, sq, 1]
+    row_valid = valid.any(axis=-1, keepdim=True)  # [b, sq, 1]
+    row_valid_bn = row_valid.unsqueeze(1)  # [b, 1, sq, 1]
     selected_logits = paddle.where(
         row_valid_bn, selected_logits, paddle.zeros_like(selected_logits)
     )
@@ -476,7 +475,7 @@ def _compute_attn_target_on_selected_set(
     probs = probs * row_valid_bn.cast("float32")
 
     # Aggregate over heads, optional TP all-reduce, then L1 normalize.
-    target = probs.sum(axis=1)                                     # [b, sq, topk_eff]
+    target = probs.sum(axis=1)  # [b, sq, topk_eff]
     if tp_group is not None and getattr(tp_group, "nranks", 1) > 1:
         paddle.distributed.all_reduce(target.contiguous(), group=tp_group)
     target = target / target.sum(axis=-1, keepdim=True).clip(min=1e-10)
@@ -495,7 +494,7 @@ class TileLangCSAIndexerLoss(paddle.autograd.PyLayer):
            ``topk_probs [B, S, topk_effective]`` over the selected set.
         2. Constructs the multi-head aggregated attention target
            ``p[t, S_t]`` on the same selected set via
-           ``_compute_attn_target_on_selected_set``.
+           ``_compute_attn_target``.
         3. Returns the scalar KL loss
            ``KL(p[t,S_t] || softmax(I[t,S_t])) * loss_coeff``.
 
@@ -510,7 +509,7 @@ class TileLangCSAIndexerLoss(paddle.autograd.PyLayer):
 
         ``grad_index_scores = (topk_probs - target) * loss_coeff / num_rows``
         is multiplied by the upstream ``grad_loss`` and forwarded to
-        ``tilelang_csa_compressed_indexer_bwd_paddle``.
+        ``csa_indexer_bwd``.
 
     Phase semantics:
         * Phase 2 (``dsa_indexer_use_sparse_loss=False``): caller passes
@@ -530,11 +529,11 @@ class TileLangCSAIndexerLoss(paddle.autograd.PyLayer):
     @staticmethod
     def forward(
         ctx,
-        index_q: Tensor,           # [b, sq, h_i, d_i]
-        weights: Tensor,           # [b, sq, h_i]   (RAW weights, no softmax_scale baked in)
-        index_k_comp: Tensor,      # [b, sk, d_i]
-        query_mla: Tensor,         # [b, sq, np, hn]      DETACHED MLA query
-        key_comp_mla: Tensor,      # [b, sk, np, hn]      DETACHED expanded compressed KV
+        index_q: Tensor,  # [b, sq, h_i, d_i]
+        weights: Tensor,  # [b, sq, h_i]   (RAW weights, no softmax_scale baked in)
+        index_k_comp: Tensor,  # [b, sk, d_i]
+        query_mla: Tensor,  # [b, sq, np, hn]      DETACHED MLA query
+        key_comp_mla: Tensor,  # [b, sk, np, hn]      DETACHED expanded compressed KV
         ratio: int,
         topk_effective: int,
         softmax_scale: float,
@@ -547,29 +546,27 @@ class TileLangCSAIndexerLoss(paddle.autograd.PyLayer):
         # the selected ``[B,S,topk_effective]`` tensors and backward never
         # touches the full ``[B,S,S_comp]`` logits.
         from paddlefleet.tilelang_ops import (
-            tilelang_csa_attn_target_reducesum_paddle,
-            tilelang_csa_compressed_indexer_topk_paddle,
+            csa_attn_target_reducesum,
+            csa_indexer_topk_fwd,
         )
 
-        topk_indices, topk_probs = (
-            tilelang_csa_compressed_indexer_topk_paddle(
-                index_q,
-                index_k_comp,
-                weights,
-                ratio=int(ratio),
-                topk_effective=int(topk_effective),
-            )
+        topk_indices, topk_probs = csa_indexer_topk_fwd(
+            index_q,
+            index_k_comp,
+            weights,
+            ratio=int(ratio),
+            topk_effective=int(topk_effective),
         )
 
         TileLangCSAIndexerLoss._last_topk_indices = topk_indices.detach()
         TileLangCSAIndexerLoss._last_topk_probs = topk_probs.detach()
 
         if tp_group is not None and getattr(tp_group, "nranks", 1) > 1:
-            target = _compute_attn_target_on_selected_set(
+            target = _compute_attn_target(
                 query_mla, key_comp_mla, topk_indices, softmax_scale, tp_group
             )
         else:
-            target = tilelang_csa_attn_target_reducesum_paddle(
+            target = csa_attn_target_reducesum(
                 query_mla,
                 key_comp_mla,
                 topk_indices,
@@ -594,7 +591,7 @@ class TileLangCSAIndexerLoss(paddle.autograd.PyLayer):
     @staticmethod
     def backward(ctx, grad_loss: Tensor):
         from paddlefleet.tilelang_ops import (
-            tilelang_csa_compressed_indexer_bwd_paddle,
+            csa_indexer_bwd,
         )
 
         (
@@ -616,14 +613,12 @@ class TileLangCSAIndexerLoss(paddle.autograd.PyLayer):
         if grad_loss is not None:
             grad_index_scores = grad_index_scores * grad_loss
 
-        grad_q, grad_weights, grad_k = (
-            tilelang_csa_compressed_indexer_bwd_paddle(
-                index_q,
-                weights,
-                index_k_comp,
-                topk_indices,
-                grad_index_scores,
-            )
+        grad_q, grad_weights, grad_k = csa_indexer_bwd(
+            index_q,
+            weights,
+            index_k_comp,
+            topk_indices,
+            grad_index_scores,
         )
 
         # Forward signature has 5 tensor inputs; query_mla / key_comp_mla
@@ -1241,21 +1236,19 @@ class CompressedSparseAttention(FleetLayer):
                 # already produced TileLang indices (use_tilelang_loss_path).
                 if use_tilelang_indexer and not use_tilelang_loss_path:
                     from paddlefleet.tilelang_ops import (
-                        tilelang_csa_compressed_indexer_topk_paddle,
+                        csa_indexer_topk_fwd,
                     )
 
                     with paddle.no_grad():
                         q_indexer_tl, k_indexer_tl, weights_indexer_tl = (
                             self.indexer.forward_before_topk(x_det, qr_det)
                         )
-                        tl_topk_indices, _tl_topk_scores = (
-                            tilelang_csa_compressed_indexer_topk_paddle(
-                                q_indexer_tl,
-                                k_indexer_tl,
-                                weights_indexer_tl,
-                                ratio=self.compress_ratio,
-                                topk_effective=topk_effective,
-                            )
+                        tl_topk_indices, _tl_topk_scores = csa_indexer_topk_fwd(
+                            q_indexer_tl,
+                            k_indexer_tl,
+                            weights_indexer_tl,
+                            ratio=self.compress_ratio,
+                            topk_effective=topk_effective,
                         )
 
                     topk_indices_compressed = tl_topk_indices

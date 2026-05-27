@@ -1,4 +1,17 @@
-# ruff: noqa
+# Copyright (c) 2026 PaddlePaddle Authors. All Rights Reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 # TileLang backward kernel for DeepSeek V4 CSA compressed indexer.
 #
 # This kernel consumes selected compressed block indices plus OGrad and computes
@@ -20,7 +33,6 @@
 # contribute zero gradient. The caller pads grad_scores with 0 for invalid
 # slots before calling this kernel.
 
-import math
 
 import paddle
 import tilelang
@@ -105,13 +117,16 @@ def tl_csa_indexer_bwd_impl(
 
             for bi_i in T.Pipelined(num_blocks, num_stages=num_stages):
                 for i in T.Parallel(block_I):
-                    indices_shared[i] = TopkIndices[i_b, i_t, bi_i * block_I + i]
+                    indices_shared[i] = TopkIndices[
+                        i_b, i_t, bi_i * block_I + i
+                    ]
                     grad_shared[i] = OGrad[i_b, i_t, bi_i * block_I + i]
                 T.sync_threads()
 
                 for i, j in T.Parallel(block_I, dim):
                     index_k_shared[i, j] = T.if_then_else(
-                        (indices_shared[i] >= 0) & (indices_shared[i] < seq_len_comp),
+                        (indices_shared[i] >= 0)
+                        & (indices_shared[i] < seq_len_comp),
                         IndexKComp[i_b, indices_shared[i], j],
                         0,
                     )
@@ -134,7 +149,8 @@ def tl_csa_indexer_bwd_impl(
                 d_weights_i = T.alloc_fragment((block_I, heads), dtype=FP32)
                 for i, j in T.Parallel(block_I, heads):
                     d_weights_i[i, j] = T.if_then_else(
-                        (indices_shared[i] >= 0) & (indices_shared[i] < seq_len_comp),
+                        (indices_shared[i] >= 0)
+                        & (indices_shared[i] < seq_len_comp),
                         grad_shared[i] * logits[i, j],
                         0,
                     )
@@ -142,7 +158,11 @@ def tl_csa_indexer_bwd_impl(
 
                 for i, j in T.Parallel(block_I, heads):
                     d_logits_qk[i, j] = T.if_then_else(
-                        ((indices_shared[i] >= 0) & (indices_shared[i] < seq_len_comp)) & (logits[i, j] > 0),
+                        (
+                            (indices_shared[i] >= 0)
+                            & (indices_shared[i] < seq_len_comp)
+                        )
+                        & (logits[i, j] > 0),
                         grad_shared[i] * weights_shared[j],
                         0,
                     )
@@ -169,8 +189,13 @@ def tl_csa_indexer_bwd_impl(
                 )
 
                 for i, j in T.Parallel(block_I, dim):
-                    if (indices_shared[i] >= 0) & (indices_shared[i] < seq_len_comp):
-                        T.atomic_add(dIndexKComp[i_b, indices_shared[i], j], d_index_k_frag[i, j])
+                    if (indices_shared[i] >= 0) & (
+                        indices_shared[i] < seq_len_comp
+                    ):
+                        T.atomic_add(
+                            dIndexKComp[i_b, indices_shared[i], j],
+                            d_index_k_frag[i, j],
+                        )
 
             for i, j in T.Parallel(heads, dim):
                 d_index_q_frag[i, j] = d_index_q_frag[i, j] * sm_scale
@@ -245,8 +270,12 @@ def csa_indexer_bwd_interface(
             [batch, seq_len, pad],
             grad_scores.dtype,
         )
-        topk_indices = paddle.concat([topk_indices, topk_pad], axis=-1).contiguous()
-        grad_scores = paddle.concat([grad_scores, grad_pad], axis=-1).contiguous()
+        topk_indices = paddle.concat(
+            [topk_indices, topk_pad], axis=-1
+        ).contiguous()
+        grad_scores = paddle.concat(
+            [grad_scores, grad_pad], axis=-1
+        ).contiguous()
 
     kernel = tl_csa_indexer_bwd_impl(
         heads=heads,
