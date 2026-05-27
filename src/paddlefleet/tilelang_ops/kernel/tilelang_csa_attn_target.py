@@ -60,7 +60,6 @@ def tl_csa_attn_target_reducesum(
             h_base = 0 if replicate_h == 1 else r_i * 64
 
             query_shared = T.alloc_shared([h_per_block, dim], dtype=dtype)
-            key_shared = T.alloc_shared([block_I, dim], dtype=dtype)
             indices_shared = T.alloc_shared([block_I], dtype=INT32)
 
             logits = T.alloc_fragment([h_per_block, block_I], dtype=FP32)
@@ -85,22 +84,17 @@ def tl_csa_attn_target_reducesum(
                     indices_shared[i] = TopkIndices[by, s_i, block_idx * block_I + i]
                 T.sync_threads()
 
-                for i, d_i in T.Parallel(block_I, dim):
-                    key_shared[i, d_i] = T.if_then_else(
-                        (indices_shared[i] >= 0) & (indices_shared[i] < seq_len_comp),
-                        KeyComp[by, indices_shared[i], h_base, d_i],
-                        0,
-                    )
-                T.sync_threads()
-
-                T.gemm(
-                    query_shared,
-                    key_shared,
-                    logits,
-                    transpose_A=False,
-                    transpose_B=True,
-                    clear_accum=True,
-                )
+                for h_i, i in T.Parallel(h_per_block, block_I):
+                    logits[h_i, i] = 0
+                for d_i in T.serial(dim):
+                    for h_i, i in T.Parallel(h_per_block, block_I):
+                        logits[h_i, i] += T.if_then_else(
+                            ((h_base + h_i) < heads)
+                            & (indices_shared[i] >= 0)
+                            & (indices_shared[i] < seq_len_comp),
+                            query_shared[h_i, d_i] * KeyComp[by, indices_shared[i], h_base + h_i, d_i],
+                            0,
+                        )
                 for h_i, i in T.Parallel(h_per_block, block_I):
                     logits[h_i, i] = T.if_then_else(
                         ((h_base + h_i) < heads)
@@ -120,22 +114,17 @@ def tl_csa_attn_target_reducesum(
                     indices_shared[i] = TopkIndices[by, s_i, block_idx * block_I + i]
                 T.sync_threads()
 
-                for i, d_i in T.Parallel(block_I, dim):
-                    key_shared[i, d_i] = T.if_then_else(
-                        (indices_shared[i] >= 0) & (indices_shared[i] < seq_len_comp),
-                        KeyComp[by, indices_shared[i], h_base, d_i],
-                        0,
-                    )
-                T.sync_threads()
-
-                T.gemm(
-                    query_shared,
-                    key_shared,
-                    logits,
-                    transpose_A=False,
-                    transpose_B=True,
-                    clear_accum=True,
-                )
+                for h_i, i in T.Parallel(h_per_block, block_I):
+                    logits[h_i, i] = 0
+                for d_i in T.serial(dim):
+                    for h_i, i in T.Parallel(h_per_block, block_I):
+                        logits[h_i, i] += T.if_then_else(
+                            ((h_base + h_i) < heads)
+                            & (indices_shared[i] >= 0)
+                            & (indices_shared[i] < seq_len_comp),
+                            query_shared[h_i, d_i] * KeyComp[by, indices_shared[i], h_base + h_i, d_i],
+                            0,
+                        )
                 for h_i, i in T.Parallel(h_per_block, block_I):
                     logits[h_i, i] = T.if_then_else(
                         ((h_base + h_i) < heads)
@@ -154,22 +143,17 @@ def tl_csa_attn_target_reducesum(
                     indices_shared[i] = TopkIndices[by, s_i, block_idx * block_I + i]
                 T.sync_threads()
 
-                for i, d_i in T.Parallel(block_I, dim):
-                    key_shared[i, d_i] = T.if_then_else(
-                        (indices_shared[i] >= 0) & (indices_shared[i] < seq_len_comp),
-                        KeyComp[by, indices_shared[i], h_base, d_i],
-                        0,
-                    )
-                T.sync_threads()
-
-                T.gemm(
-                    query_shared,
-                    key_shared,
-                    logits,
-                    transpose_A=False,
-                    transpose_B=True,
-                    clear_accum=True,
-                )
+                for h_i, i in T.Parallel(h_per_block, block_I):
+                    logits[h_i, i] = 0
+                for d_i in T.serial(dim):
+                    for h_i, i in T.Parallel(h_per_block, block_I):
+                        logits[h_i, i] += T.if_then_else(
+                            ((h_base + h_i) < heads)
+                            & (indices_shared[i] >= 0)
+                            & (indices_shared[i] < seq_len_comp),
+                            query_shared[h_i, d_i] * KeyComp[by, indices_shared[i], h_base + h_i, d_i],
+                            0,
+                        )
                 for h_i, i in T.Parallel(h_per_block, block_I):
                     logits[h_i, i] = T.if_then_else(
                         ((h_base + h_i) < heads)
@@ -239,7 +223,8 @@ def csa_attn_target_reducesum_interface(
     )
     scale = paddle.full([1], float(softmax_scale), dtype="float32")
     kernel(query, key_comp, topk_indices, scale, partial)
-    target = partial[:, :, :, :topk_effective].sum(axis=2)
-    target = target / target.sum(axis=-1, keepdim=True).clip(min=1e-10)
     valid = topk_indices[:, :, :topk_effective] >= 0
+    target = partial[:, :, :, :topk_effective].sum(axis=2)
+    target = paddle.where(valid, target, paddle.zeros_like(target))
+    target = target / target.sum(axis=-1, keepdim=True).clip(min=1e-10)
     return paddle.where(valid, target, paddle.zeros_like(target))
