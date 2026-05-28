@@ -25,11 +25,12 @@ from paddlefleet.models.gpt.gpt_layer_specs import (
 )
 from paddlefleet.transformer.csa_attention import (
     CompressedSparseAttention,
-    _get_doc_start,
+    _build_compressed_causal_mask,
+    _map_compressed_topk_to_kv_full,
     get_compress_topk_idxs,
     get_window_topk_idxs,
 )
-from paddlefleet.transformer.dsa_attention import fused_qk_topk_naive
+from paddlefleet.transformer.dsa_attention import FusedDSAIndexerLoss, fused_qk_topk_naive
 from paddlefleet.transformer.dsv4_hybrid_attention import (
     DSv4HybridSelfAttention,
 )
@@ -144,67 +145,7 @@ class TestDSv4HybridConfigAndSpec(unittest.TestCase):
 
 
 class TestCSAIndexHelpers(unittest.TestCase):
-    def test_doc_start_accepts_1d_and_2d_masks(self):
-        mask_1d = paddle.to_tensor([4, 4, 4, 4, 8, 8, 8, 8], dtype="int64")
-        doc_start_1d = _get_doc_start(mask_1d, seqlen=8)
-        self.assertEqual(
-            doc_start_1d.numpy().tolist(), [0, 0, 0, 0, 4, 4, 4, 4]
-        )
-
-        mask_2d = paddle.stack([mask_1d, mask_1d])
-        doc_start_2d = _get_doc_start(mask_2d, seqlen=8)
-        self.assertEqual(
-            doc_start_2d.numpy().tolist(),
-            [[0, 0, 0, 0, 4, 4, 4, 4], [0, 0, 0, 0, 4, 4, 4, 4]],
-        )
-
-    def test_window_and_compress_indices_with_document_boundaries(self):
-        boundaries = paddle.to_tensor(
-            [[[[4], [4], [4], [4], [8], [8], [8], [8]]]], dtype="int64"
-        )
-
-        window = get_window_topk_idxs(
-            window_size=3,
-            batch_size=1,
-            seqlen=8,
-            attn_mask_startend_row_indices=boundaries,
-        )
-        self.assertEqual(
-            window.numpy().tolist()[0],
-            [
-                [0, -1, -1],
-                [0, 1, -1],
-                [0, 1, 2],
-                [1, 2, 3],
-                [4, -1, -1],
-                [4, 5, -1],
-                [4, 5, 6],
-                [5, 6, 7],
-            ],
-        )
-
-        compressed = get_compress_topk_idxs(
-            ratio=4,
-            batch_size=1,
-            seqlen=8,
-            offset=8,
-            attn_mask_startend_row_indices=boundaries,
-        )
-        self.assertEqual(
-            compressed.numpy().tolist()[0],
-            [
-                [-1, -1],
-                [-1, -1],
-                [-1, -1],
-                [8, -1],
-                [-1, -1],
-                [-1, -1],
-                [-1, -1],
-                [-1, 9],
-            ],
-        )
-
-    def test_window_and_compress_indices_without_document_boundaries(self):
+    def test_window_and_compress_indices(self):
         window = get_window_topk_idxs(
             window_size=3,
             batch_size=2,
