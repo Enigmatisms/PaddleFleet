@@ -24,7 +24,6 @@ paddle.enable_compat(scope={"tilelang"}, silent=True)
 # Helpers
 # =========================================================================
 
-
 def _cuda_or_skip(testcase):
     if not paddle.device.is_compiled_with_cuda():
         testcase.skipTest("CUDA build of Paddle is required")
@@ -214,7 +213,6 @@ def _paddle_ref_csa_indexer_topk(q, k, weights, ratio, topk_effective):
 # Kernel tests
 # =========================================================================
 
-
 class TestTileLangCSAIndexerKernel(unittest.TestCase):
     """Correctness of raw TileLang kernel interfaces."""
 
@@ -366,7 +364,6 @@ class TestTileLangCSAIndexerKernel(unittest.TestCase):
 class TestTileLangCSAIndexerWrapperForward(unittest.TestCase):
     def setUp(self):
         from paddlefleet.tilelang_ops import csa_indexer_topk_fwd
-
         self._kernel = csa_indexer_topk_fwd
 
     def test_phase3_selected_topk_matches_reference(self):
