@@ -634,7 +634,6 @@ class Compressor(nn.Layer):
 
         Args:
             x: [b, sq, hidden_size]
-            attn_mask_startend_row_indices: optional packed-document boundaries.
 
         Returns:
             compressed_kv: [b, sq // ratio, head_dim] or None if too short.
@@ -777,7 +776,6 @@ class CSAIndexer(nn.Layer):
         self,
         x: Tensor,  # [b, sq, hidden_size]
         qr: Tensor,  # [b, sq, q_lora_rank]
-        attn_mask_startend_row_indices: Tensor | None = None,
     ) -> tuple[Tensor, Tensor, Tensor]:
         """Compute Q, compressed K, and weights before top-k selection."""
         b, sq, _ = x.shape
@@ -798,10 +796,7 @@ class CSAIndexer(nn.Layer):
         q = rotate_activation(q)
 
         # K path: own compressor (already applies RoPE and rotation internally)
-        k = self.compressor(
-            x,
-            attn_mask_startend_row_indices=attn_mask_startend_row_indices,
-        )  # [b, n_compressed, index_head_dim]
+        k = self.compressor(x)  # [b, n_compressed, index_head_dim]
 
         # Weights
         weights, _ = self.linear_weights_proj(x)  # [b, sq, n_heads]
@@ -814,7 +809,6 @@ class CSAIndexer(nn.Layer):
         x: Tensor,
         qr: Tensor,
         mask: Tensor | None = None,
-        attn_mask_startend_row_indices: Tensor | None = None,
     ) -> tuple[Tensor, Tensor]:
         """Return (index_scores, topk_indices).
 
@@ -827,11 +821,7 @@ class CSAIndexer(nn.Layer):
             index_scores: [b, sq, n_compressed]
             topk_indices: [b, sq, topk]
         """
-        q, k, weights = self.forward_before_topk(
-            x,
-            qr,
-            attn_mask_startend_row_indices=attn_mask_startend_row_indices,
-        )
+        q, k, weights = self.forward_before_topk(x, qr)
         effective_topk = min(self.index_topk, k.shape[1])
         index_scores, topk_indices = fused_qk_topk_naive(
             q, k, weights, effective_topk, mask
@@ -958,10 +948,7 @@ class CompressedSparseAttention(FleetLayer):
 
         # Step 2: Compression
         if self.compressor is not None and self.compress_ratio > 1:
-            compressed_kv = self.compressor(
-                x,
-                attn_mask_startend_row_indices=attn_mask_startend_row_indices,
-            )  # [b, n_compressed, v_head_dim]
+            compressed_kv = self.compressor(x)  # [b, n_compressed, v_head_dim]
             if compressed_kv is not None:
                 kv_full = paddle.concat([kv, compressed_kv], axis=1)
                 n_compressed = compressed_kv.shape[1]
@@ -1076,11 +1063,7 @@ class CompressedSparseAttention(FleetLayer):
                         )
                 elif self.training:
                     q_indexer, k_indexer, weights_indexer = (
-                        self.indexer.forward_before_topk(
-                            x_det,
-                            qr_det,
-                            attn_mask_startend_row_indices=attn_mask_startend_row_indices,
-                        )
+                        self.indexer.forward_before_topk(x_det, qr_det)
                     )
                     indexer_loss_coeff = getattr(
                         self.config, "dsa_indexer_loss_coeff", 0.0
