@@ -26,6 +26,16 @@ import tilelang
 from tilelang import language as T
 
 
+def _tilelang_dtype(tensor):
+    if tensor.dtype == paddle.bfloat16:
+        return "bfloat16"
+    if tensor.dtype == paddle.float16:
+        return "float16"
+    raise TypeError(
+        f"TileLang CSA attention target expects bf16/fp16 inputs, got {tensor.dtype}"
+    )
+
+
 @tilelang.jit(
     pass_configs={
         tilelang.PassConfigKey.TL_DISABLE_TMA_LOWER: True,
@@ -255,7 +265,7 @@ def csa_attn_target_reducesum_interface(
         dim=dim,
         topk=padded_topk,
         block_I=block_I,
-        dtype="bfloat16",
+        dtype=_tilelang_dtype(query),
         num_stages=num_stages,
         num_threads=num_threads,
     )

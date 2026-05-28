@@ -548,7 +548,7 @@ class TestTileLangCSAIndexerLossGrad(unittest.TestCase):
         kd.stop_gradient = False
         wd = weights.detach().clone()
         wd.stop_gradient = False
-        loss = TileLangCSAIndexerLoss.apply(
+        loss, _topk_indices = TileLangCSAIndexerLoss.apply(
             qd,
             wd,
             kd,

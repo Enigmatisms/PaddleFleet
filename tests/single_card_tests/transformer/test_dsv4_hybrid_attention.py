@@ -25,12 +25,12 @@ from paddlefleet.models.gpt.gpt_layer_specs import (
 )
 from paddlefleet.transformer.csa_attention import (
     CompressedSparseAttention,
-    _build_compressed_causal_mask,
-    _map_compressed_topk_to_kv_full,
     get_compress_topk_idxs,
     get_window_topk_idxs,
 )
-from paddlefleet.transformer.dsa_attention import FusedDSAIndexerLoss, fused_qk_topk_naive
+from paddlefleet.transformer.dsa_attention import (
+    fused_qk_topk_naive,
+)
 from paddlefleet.transformer.dsv4_hybrid_attention import (
     DSv4HybridSelfAttention,
 )
@@ -150,7 +150,6 @@ class TestCSAIndexHelpers(unittest.TestCase):
             window_size=3,
             batch_size=2,
             seqlen=4,
-            attn_mask_startend_row_indices=None,
         )
         self.assertEqual(list(window.shape), [2, 4, 3])
         self.assertEqual(
@@ -163,7 +162,6 @@ class TestCSAIndexHelpers(unittest.TestCase):
             batch_size=2,
             seqlen=8,
             offset=8,
-            attn_mask_startend_row_indices=None,
         )
         self.assertEqual(list(compressed.shape), [2, 8, 2])
         self.assertEqual(
