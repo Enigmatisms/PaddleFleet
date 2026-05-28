@@ -12,60 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import hashlib
-import json
-import os
 
 import paddle
 
 DEFAULT_INDEXER_BLOCK = 32
-_DIGEST_COUNTERS = {}
-
-
-def _digest_enabled():
-    return os.getenv("DSV4_TILELANG_DIGEST", "0").lower() in {
-        "1",
-        "true",
-        "yes",
-        "on",
-    }
-
-
-def _digest_limit():
-    try:
-        return int(os.getenv("DSV4_TILELANG_DIGEST_LIMIT", "40"))
-    except ValueError:
-        return 40
-
-
-def _tensor_digest(name, tensor):
-    tensor_f32 = tensor.detach().cast("float32").cpu()
-    array = tensor_f32.numpy()
-    return {
-        "name": name,
-        "shape": list(tensor.shape),
-        "dtype": str(tensor.dtype),
-        "sha256": hashlib.sha256(array.tobytes()).hexdigest(),
-        "sum_f32": float(array.sum()),
-        "max_abs_f32": float(abs(array).max()) if array.size else 0.0,
-    }
-
-
-def _digest_log(op, **tensors):
-    if not _digest_enabled():
-        return
-    count = _DIGEST_COUNTERS.get(op, 0)
-    if count >= _digest_limit():
-        return
-    _DIGEST_COUNTERS[op] = count + 1
-    payload = {
-        "op": op,
-        "call": count,
-        "tensors": [
-            _tensor_digest(name, tensor) for name, tensor in tensors.items()
-        ],
-    }
-    print("[TileLangDigest] " + json.dumps(payload, sort_keys=True), flush=True)
 
 
 def _get_csa_indexer_topk_fwd_interface():
