@@ -1995,9 +1995,11 @@ class FusionMoePyLayer(paddle.autograd.PyLayer):
             scale = fp8_dispatched_handle["scale"]
             hidden_states = (hidden_states, scale)
 
+        paddle.base.core.nvprof_nvtx_push("mlp_forward")
         out = ctx.node.forward(
             hidden_states, dispatched_indices, dispatched_probs
         )
+        paddle.base.core.nvprof_nvtx_pop()
 
         if is_first_fwd:
             # Under full recompute's first forward (no_grad), the inner PyLayer's
@@ -2029,9 +2031,11 @@ class FusionMoePyLayer(paddle.autograd.PyLayer):
         """
         (cached_tensors,) = ctx.saved_tensor()
         ctx.node.set_cached_tensors(cached_tensors)
+        paddle.base.core.nvprof_nvtx_push("mlp_backward")
         hidden_states_grad, dispatched_probs_grad = ctx.node.backward(
             output_grad
         )
+        paddle.base.core.nvprof_nvtx_pop()
         return hidden_states_grad, dispatched_probs_grad, None
 
 

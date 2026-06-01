@@ -60,6 +60,37 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+class NvtxBegin(paddle.autograd.PyLayer):
+    @staticmethod
+    def forward(ctx, name, *tensors):
+        paddle.base.core.nvprof_nvtx_push(name + "_fw")
+        tensors = [(t.clone() if t.is_leaf else t) for t in tensors]
+        return tensors[0] if len(tensors) == 1 else tensors
+
+    @staticmethod
+    def backward(ctx, *grads):
+        paddle.base.core.nvprof_nvtx_pop()
+        return grads[0] if len(grads) == 1 else grads
+
+
+class NvtxEnd(paddle.autograd.PyLayer):
+    @staticmethod
+    def forward(ctx, name, *tensors):
+        paddle.base.core.nvprof_nvtx_pop()
+        ctx.name = name
+        tensors = [(t.clone() if t.is_leaf else t) for t in tensors]
+        return tensors[0] if len(tensors) == 1 else tensors
+
+    @staticmethod
+    def backward(ctx, *grads):
+        paddle.base.core.nvprof_nvtx_push(ctx.name + "_bw")
+        return grads[0] if len(grads) == 1 else grads
+
+
+paddle.nvtx_begin = NvtxBegin.apply
+paddle.nvtx_end = NvtxEnd.apply
+
+
 def tensors_clone(outputs):
     """
     The tensors required for recompute_forward need to be cloned to prevent them from being released prematurely and becoming inaccessible.
@@ -1146,14 +1177,23 @@ class HyperConnectionTransformerLayer(TransformerLayer):
         **kwargs,
     ):
         """mHC attention forward: aggregate → layernorm → attention → fused_h_res_h_post_bda."""
+        print(
+            f"decoder {self.layer_number} :"
+            f" grad={int(paddle.framework._dygraph_tracer()._has_grad)}"
+            f" use={paddle.device.memory_allocated()/2**30:.3f}"
+            f" buf={paddle.device.memory_reserved()/2**30:.3f}"
+        )
+        hidden_states = paddle.nvtx_begin(f"decoder_{self.layer_number}", hidden_states)
         # Save n-stream residual for H_res mixing
         original_residual = hidden_states
         ori_dtype = hidden_states.dtype
 
         # mHC: aggregate n-stream → 1-stream
+        hidden_states = paddle.nvtx_begin("attn_pre", hidden_states)
         aggregated, h_res, h_post = self.self_attention_hyper_connection(
             hidden_states
         )
+        aggregated, h_res, h_post = paddle.nvtx_end("attn_pre", aggregated, h_res, h_post)
         aggregated = aggregated.to(ori_dtype)
 
         # LayerNorm on aggregated single stream
@@ -1167,6 +1207,7 @@ class HyperConnectionTransformerLayer(TransformerLayer):
         )
 
         # Self-attention
+        input_layernorm_output = paddle.nvtx_begin("self_attn", input_layernorm_output)
         if rope_freqs_cis is not None:
             attention_output_with_bias = self.self_attn(
                 input_layernorm_output,
@@ -1191,8 +1232,13 @@ class HyperConnectionTransformerLayer(TransformerLayer):
                 packed_seq_params=packed_seq_params,
                 in_recompute=in_recompute,
             )
+        attention_output_with_bias = (
+            paddle.nvtx_end("self_attn", attention_output_with_bias[0]),
+            attention_output_with_bias[1],
+        )
 
         # mHC: fused H_res + H_post + bias-dropout-add
+        paddle.base.core.nvprof_nvtx_push("attn_post")
         with paddle.enable_grad():
             hidden_states = (
                 self.self_attention_hyper_connection.fused_h_res_h_post_bda(
@@ -1206,6 +1252,7 @@ class HyperConnectionTransformerLayer(TransformerLayer):
                 )
             )
             hidden_states = hidden_states.to(ori_dtype)
+        paddle.base.core.nvprof_nvtx_pop()
 
         # Cross attention (unchanged)
         residual = hidden_states
@@ -1247,7 +1294,9 @@ class HyperConnectionTransformerLayer(TransformerLayer):
         ori_dtype = hidden_states.dtype
 
         # mHC: aggregate n-stream → 1-stream
+        hidden_states = paddle.nvtx_begin("mlp_pre", hidden_states)
         aggregated, h_res, h_post = self.mlp_hyper_connection(hidden_states)
+        aggregated, h_res, h_post = paddle.nvtx_end("mlp_pre", aggregated, h_res, h_post)
         aggregated = aggregated.to(ori_dtype)
 
         # LayerNorm on aggregated single stream
@@ -1302,6 +1351,7 @@ class HyperConnectionTransformerLayer(TransformerLayer):
                 mlp_output_with_bias = self.mlp(post_attention_layernorm_output)
 
         # mHC: fused H_res + H_post + bias-dropout-add
+        paddle.base.core.nvprof_nvtx_push("mlp_post")
         with paddle.enable_grad():
             hidden_states = self.mlp_hyper_connection.fused_h_res_h_post_bda(
                 h_res=h_res,
@@ -1313,10 +1363,12 @@ class HyperConnectionTransformerLayer(TransformerLayer):
                 fused=self.config.bias_dropout_fusion,
             )
             hidden_states = hidden_states.to(ori_dtype)
+        paddle.base.core.nvprof_nvtx_pop()
 
         if is_first_fwd:
             hidden_states.stop_gradient = False
 
+        hidden_states = paddle.nvtx_end(f"decoder_{self.layer_number}", hidden_states)
         return hidden_states
 
 

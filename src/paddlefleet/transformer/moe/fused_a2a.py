@@ -106,6 +106,7 @@ def get_buffer(group: Group, hidden_bytes: int):
     Returns:
         Buffer: Communication buffer
     """
+    configure_buffer(52, [60, 256], [20, 256])
     global _buffer
     num_nvl_bytes, num_rdma_bytes = 0, 0
     for config in (

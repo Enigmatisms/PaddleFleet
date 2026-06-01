@@ -1264,6 +1264,7 @@ class CompressedSparseAttention(FleetLayer):
 
         # Step 2: Compression
         if self.compressor is not None and self.compress_ratio > 1:
+            x = paddle.nvtx_begin(f"compressor_{self.compress_ratio}x", x)
             compressed_kv = self.compressor(x)  # [b, n_compressed, v_head_dim]
             if compressed_kv is not None:
                 kv_full = paddle.concat([kv, compressed_kv], axis=1)
@@ -1271,6 +1272,7 @@ class CompressedSparseAttention(FleetLayer):
             else:
                 kv_full = kv
                 n_compressed = 0
+            compressed_kv = paddle.nvtx_end(f"compressor_{self.compress_ratio}x", compressed_kv)
         else:
             kv_full = kv
             n_compressed = 0
@@ -1278,7 +1280,9 @@ class CompressedSparseAttention(FleetLayer):
         offset = sq  # compressed indices start after original positions
 
         # Step 3: Window indices
+        paddle.base.core.nvprof_nvtx_push("window_topk")
         window_idxs = get_window_topk_idxs(self.window_size, b, sq)
+        paddle.base.core.nvprof_nvtx_pop()
 
         # Step 4: Compressed indices
         indexer_loss = None
@@ -1286,6 +1290,7 @@ class CompressedSparseAttention(FleetLayer):
 
         if self.compress_ratio > 1 and n_compressed > 0:
             if self.indexer is not None:
+                paddle.base.core.nvprof_nvtx_push("indexer")
                 (
                     compress_topk_idxs,
                     indexer_loss,
@@ -1298,14 +1303,17 @@ class CompressedSparseAttention(FleetLayer):
                     n_compressed,
                     offset,
                 )
+                paddle.base.core.nvprof_nvtx_pop()
             else:
                 # ratio=128: attend to all compressed positions
+                paddle.base.core.nvprof_nvtx_push("compress_topk")
                 compress_topk_idxs = get_compress_topk_idxs(
                     self.compress_ratio,
                     b,
                     sq,
                     offset,
                 )
+                paddle.base.core.nvprof_nvtx_pop()
 
             if compress_topk_idxs.dtype != window_idxs.dtype:
                 compress_topk_idxs = compress_topk_idxs.cast(window_idxs.dtype)
@@ -1318,6 +1326,14 @@ class CompressedSparseAttention(FleetLayer):
         topk_idxs = topk_idxs.cast("int32")
 
         # Step 5: Sparse attention
+        paddle.set_printoptions(linewidth=160)
+        non_zero_topks = paddle.sum(topk_idxs != -1).item()
+        # print(
+        #     f"sparse_attn:\n{query=}\n{kv_full=}\nattn_sink={self.attn_sink}\n"
+        #     f"{non_zero_topks=}\n"
+        #     f"{topk_idxs=}\nsoftmax_scale={self.softmax_scale}\n", end="", flush=True
+        # )
+        query, kv_full = paddle.nvtx_begin("sparse_attn", query, kv_full)
         output = self.compressed_sparse_attn(
             query,
             kv_full,
@@ -1325,6 +1341,7 @@ class CompressedSparseAttention(FleetLayer):
             topk_idxs,
             self.softmax_scale,
         )
+        output = paddle.nvtx_end("sparse_attn", output)
 
         # Step 6: Attach indexer loss
         if tilelang_indexer_loss_state is not None and self.training:

@@ -949,6 +949,7 @@ class FusedDSAIndexerLoss(paddle.autograd.PyLayer):
         Returns:
             indexer_loss: scalar KL divergence loss
         """
+        paddle.base.core.nvprof_nvtx_push("indexer_loss_fw")
         # Step 1: Compute index_scores from (q, weights, k)
         index_scores = _compute_index_scores_fused(q, weights, k)  # [b, sq, sk]
 
@@ -988,6 +989,7 @@ class FusedDSAIndexerLoss(paddle.autograd.PyLayer):
         ctx.tp_group = tp_group
         ctx.causal_mask_override = mask
 
+        paddle.base.core.nvprof_nvtx_pop()
         return indexer_loss
 
     @staticmethod
@@ -998,6 +1000,7 @@ class FusedDSAIndexerLoss(paddle.autograd.PyLayer):
             q, weights, k, query, key, mask
         (Paddle PyLayer only counts Tensor params, not float/int/bool/None.)
         """
+        paddle.base.core.nvprof_nvtx_push("indexer_loss_bw")
         q, weights, k, query, key, topk_indices = ctx.saved_tensor()
 
         grad_q, grad_weights, grad_k = _bwd_fused_indexer_loss(
@@ -1015,6 +1018,7 @@ class FusedDSAIndexerLoss(paddle.autograd.PyLayer):
             causal_mask_override=ctx.causal_mask_override,
         )
 
+        paddle.base.core.nvprof_nvtx_pop()
         return grad_q, grad_weights, grad_k, None, None, None
 
 

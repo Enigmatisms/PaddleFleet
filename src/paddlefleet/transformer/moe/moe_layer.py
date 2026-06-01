@@ -661,10 +661,12 @@ class MoELayer(nn.Layer):
             hidden_states = self.fc1_latent_proj(hidden_states)
 
         should_log_balance = framework._dygraph_tracer()._has_grad
+        paddle.base.core.nvprof_nvtx_push("dispatch")
         with profile("dispatch"):
             dispatched_hidden_states, fp8_dispatched_handle = self.dispatch(
                 hidden_states, probs, routing_map, topk_weights, topk_indices
             )
+        paddle.base.core.nvprof_nvtx_pop()
         if should_log_balance and global_moe_balance_training_logs_enabled():
             log_moe_balance(
                 self.layer_number,
@@ -715,12 +717,14 @@ class MoELayer(nn.Layer):
                     is_first_fwd=not framework._dygraph_tracer()._has_grad,
                 )
 
+        paddle.base.core.nvprof_nvtx_push("combine")
         with profile("combine"):
             hidden_states = self.token_dispatcher._comm_manager.combine(
                 hidden_states,
                 combine_overlap_handle,
                 use_rr_deepep_combine=self.use_rr_deepep_combine,
             )
+        paddle.base.core.nvprof_nvtx_pop()
 
         # Latent MoE: project back from latent space to hidden_size
         if self.use_latent_moe:
@@ -919,6 +923,7 @@ class MoELayer(nn.Layer):
 
         layer_idx = getattr(self, "layer_number", None)
         _log_moe_md5(hidden_states, "moe_input", layer_idx)
+        paddle.base.core.nvprof_nvtx_push("gate")
         (
             capacity,
             topk_weights,
@@ -932,6 +937,7 @@ class MoELayer(nn.Layer):
             hidden_states,
             input_ids=input_ids,
         )
+        paddle.base.core.nvprof_nvtx_pop()
         # topk_weights, topk_indices: Shape is [seq_len, moe_router_topk]
         # probs: combine weights in [S, E] sparse layout (non-selected positions are 0) [seq_len, num_experts]
         # mask (routing_map): binary selection matrix [seq_len, num_experts]
@@ -995,13 +1001,16 @@ class MoELayer(nn.Layer):
 
         _log_moe_md5(output, "moe_routed_output", layer_idx)
 
+        paddle.base.core.nvprof_nvtx_push("aux_loss")
         if self.training and self.router_aux_loss_coef and aux_loss is not None:
             aux_loss = aux_loss * float(self.router_aux_loss_coef)
             output = AddAuxiliaryLoss.apply(output, aux_loss)
 
         if self.training and z_loss is not None:
             output = AddAuxiliaryLoss.apply(output, z_loss)
+        paddle.base.core.nvprof_nvtx_pop()
 
+        paddle.base.core.nvprof_nvtx_push("shared_expert")
         output = output.reshape(orig_shape)
         if self.shared_experts is not None:
             if combine_overlap_handle is not None:
@@ -1009,6 +1018,7 @@ class MoELayer(nn.Layer):
             else:
                 shared_output = self.shared_experts(residuals)[0]
             output = output + shared_output
+        paddle.base.core.nvprof_nvtx_pop()
 
         _log_moe_md5(output, "moe_final_output", layer_idx)
 

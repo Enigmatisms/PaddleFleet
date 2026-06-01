@@ -213,11 +213,14 @@ class DSv4HybridAttention(Attention):
             (output [b, sq, hidden_size], bias=None)
         """
         # Get Q, K, V tensors
+        hidden_states = paddle.nvtx_begin("get_qkv", hidden_states)
         query, key, value, q_compressed, kv_compressed = (
             self.get_query_key_value_tensors(hidden_states)
         )
+        query, key, value = paddle.nvtx_end("get_qkv",  query, key, value)
 
         # Core attention (CompressedSparseAttention)
+        query, key, value = paddle.nvtx_begin("core_attn",  query, key, value)
         core_attn_out = self.core_attention(
             query,
             key,
@@ -226,6 +229,7 @@ class DSv4HybridAttention(Attention):
             x=hidden_states,
             qr=q_compressed,
         )
+        core_attn_out = paddle.nvtx_end("core_attn", core_attn_out)
         # core_attn_out: [b, sq, np * v_head_dim]
 
         # Inverse RoPE on last qk_pos_emb_head_dim of each head
@@ -234,6 +238,7 @@ class DSv4HybridAttention(Attention):
         nope_dim = self.v_head_dim - pos_dim
 
         if pos_dim > 0:
+            core_attn_out = paddle.nvtx_begin("inv_rope", core_attn_out)
             core_attn_out = core_attn_out.reshape(
                 [b, sq, self.num_attention_heads, self.v_head_dim]
             )
@@ -258,8 +263,10 @@ class DSv4HybridAttention(Attention):
             )
             core_attn_out = paddle.concat([content_part, rot_part], axis=-1)
             core_attn_out = core_attn_out.reshape([b, sq, -1])
+            core_attn_out = paddle.nvtx_end("inv_rope", core_attn_out)
 
         # Grouped output projection
+        core_attn_out = paddle.nvtx_begin("group_o_proj", core_attn_out)
         core_attn_out = core_attn_out.reshape([b, sq, self.o_local_groups, -1])
         wo_a_weight = self.linear_o_group_proj.reshape(
             [self.o_local_groups, self.config.o_lora_rank, -1]
@@ -271,6 +278,7 @@ class DSv4HybridAttention(Attention):
 
         # Output projection
         output, bias = self.o_proj(core_attn_out)
+        output = paddle.nvtx_end("group_o_proj", output)
 
         return output, bias
 
