@@ -1111,9 +1111,8 @@ class CompressedSparseAttention(FleetLayer):
         paddle.base.core.nvprof_nvtx_pop()
 
         if use_tilelang_loss_path:
-            # Fused TileLang fwd + selected-set KL + TileLang bwd. The returned
-            # indices may be wider than main attention top-k during phase 2 and
-            # are trimmed below before sparse attention consumes them.
+            # Fused TileLang indexer forward: only compute top-K here.
+            # Target computation is deferred to after sparse-attn (uses LSE).
             indexer_loss_coeff = getattr(
                 self.config, "dsa_indexer_loss_coeff", 0.0
             )
@@ -1122,38 +1121,70 @@ class CompressedSparseAttention(FleetLayer):
                 self.indexer.forward_before_topk(x_det, qr_det)
             )
             paddle.base.core.nvprof_nvtx_pop()
-            # compressed_kv is shared across query heads; pass it directly to
-            # the target/reducesum path instead of materializing [B,S,H,D].
             key_comp_mla = compressed_kv.detach()
-            paddle.base.core.nvprof_nvtx_push("indexer_loss_fwd")
-            (
-                indexer_loss,
-                topk_indices_compressed,
-                topk_probs,
-                target,
-            ) = _compute_tilelang_csa_indexer_loss_forward(
-                q_indexer_bf,
-                weights_indexer_bf,
-                k_indexer_bf,
-                query.detach(),
-                key_comp_mla,
-                int(self.compress_ratio),
-                int(loss_topk_effective),
-                float(self.softmax_scale),
-                float(indexer_loss_coeff),
-                self.tp_group,
-            )
-            paddle.base.core.nvprof_nvtx_pop()
-            tilelang_indexer_loss_state = (
-                q_indexer_bf,
-                weights_indexer_bf,
-                k_indexer_bf,
-                topk_indices_compressed,
-                topk_probs,
-                target,
-                float(indexer_loss_coeff),
-            )
-            if indexer_loss_coeff > 0:
+
+            # Check if we can use the 1-pass LSE path (requires sparse loss
+            # mode where loss and attn use the same topk width).
+            use_lse_target = loss_topk_effective == attn_topk_effective
+
+            if use_lse_target:
+                # Only compute topK indices + probs; defer target to after
+                # sparse-attn where LSE is available.
+                from paddlefleet.tilelang_ops import csa_indexer_topk_fwd
+
+                paddle.base.core.nvprof_nvtx_push("indexer_loss_fwd")
+                topk_indices_compressed, topk_probs = csa_indexer_topk_fwd(
+                    q_indexer_bf,
+                    k_indexer_bf,
+                    weights_indexer_bf,
+                    ratio=int(self.compress_ratio),
+                    topk_effective=int(attn_topk_effective),
+                )
+                paddle.base.core.nvprof_nvtx_pop()
+                # Store partial state — target will be computed in forward()
+                # after sparse-attn provides lse_indexer.
+                tilelang_indexer_loss_state = (
+                    q_indexer_bf,
+                    weights_indexer_bf,
+                    k_indexer_bf,
+                    topk_indices_compressed,
+                    topk_probs,
+                    float(indexer_loss_coeff),
+                    key_comp_mla,
+                )
+            else:
+                # Dense loss (loss_topk > attn_topk): LSE from sparse-attn
+                # doesn't cover all loss positions; fall back to 2-pass.
+                paddle.base.core.nvprof_nvtx_push("indexer_loss_fwd")
+                (
+                    indexer_loss,
+                    topk_indices_compressed,
+                    topk_probs,
+                    target,
+                ) = _compute_tilelang_csa_indexer_loss_forward(
+                    q_indexer_bf,
+                    weights_indexer_bf,
+                    k_indexer_bf,
+                    query.detach(),
+                    key_comp_mla,
+                    int(self.compress_ratio),
+                    int(loss_topk_effective),
+                    float(self.softmax_scale),
+                    float(indexer_loss_coeff),
+                    self.tp_group,
+                )
+                paddle.base.core.nvprof_nvtx_pop()
+                tilelang_indexer_loss_state = (
+                    q_indexer_bf,
+                    weights_indexer_bf,
+                    k_indexer_bf,
+                    topk_indices_compressed,
+                    topk_probs,
+                    target,
+                    float(indexer_loss_coeff),
+                )
+
+            if indexer_loss_coeff > 0 and indexer_loss is not None:
                 DSAIndexerLossLoggingHelper.save_loss_to_tracker(
                     loss=indexer_loss,
                     layer_number=self.layer_number,
@@ -1341,8 +1372,10 @@ class CompressedSparseAttention(FleetLayer):
 
             if compress_topk_idxs.dtype != window_idxs.dtype:
                 compress_topk_idxs = compress_topk_idxs.cast(window_idxs.dtype)
+            # Compressed indices first so sparse-attn kernel can snapshot
+            # lse_indexer at the compressed-window boundary.
             topk_idxs = paddle.concat(
-                [window_idxs, compress_topk_idxs], axis=-1
+                [compress_topk_idxs, window_idxs], axis=-1
             )
         else:
             topk_idxs = window_idxs
@@ -1352,23 +1385,142 @@ class CompressedSparseAttention(FleetLayer):
         # Step 5: Sparse attention
         paddle.set_printoptions(linewidth=160)
         non_zero_topks = paddle.sum(topk_idxs != -1).item()
-        # print(
-        #     f"sparse_attn:\n{query=}\n{kv_full=}\nattn_sink={self.attn_sink}\n"
-        #     f"{non_zero_topks=}\n"
-        #     f"{topk_idxs=}\nsoftmax_scale={self.softmax_scale}\n", end="", flush=True
-        # )
         query, kv_full = paddle.nvtx_begin("sparse_attn", query, kv_full)
-        output = self.compressed_sparse_attn(
-            query,
-            kv_full,
-            self.attn_sink,
-            topk_idxs,
-            self.softmax_scale,
+
+        # Determine if we need lse_indexer (1-pass target path is active).
+        _need_lse_indexer = (
+            tilelang_indexer_loss_state is not None
+            and self.training
+            and len(tilelang_indexer_loss_state) == 7
+            and not isinstance(tilelang_indexer_loss_state[5], Tensor)
         )
+
+        if _need_lse_indexer:
+            # Use new kernel that outputs lse_indexer for 1-pass target.
+            indexer_topk = compress_topk_idxs.shape[-1]
+            output, lse_indexer = self._compressed_sparse_attn_with_lse(
+                query,
+                kv_full,
+                self.attn_sink,
+                topk_idxs,
+                self.softmax_scale,
+                indexer_topk,
+            )
+        else:
+            output = self.compressed_sparse_attn(
+                query,
+                kv_full,
+                self.attn_sink,
+                topk_idxs,
+                self.softmax_scale,
+            )
+            lse_indexer = None
         output = paddle.nvtx_end("sparse_attn", output)
 
-        # Step 6: Attach indexer loss
-        if tilelang_indexer_loss_state is not None and self.training:
+        # Step 6: Compute target from LSE (if 1-pass path) and attach loss
+        if _need_lse_indexer and lse_indexer is not None:
+            from paddlefleet.tilelang_ops import csa_attn_target_with_lse
+
+            (
+                q_indexer_bf,
+                weights_indexer_bf,
+                k_indexer_bf,
+                topk_indices_compressed,
+                topk_probs,
+                indexer_loss_coeff,
+                key_comp_mla,
+            ) = tilelang_indexer_loss_state
+
+            paddle.base.core.nvprof_nvtx_push("indexer_target_1pass")
+            target = csa_attn_target_with_lse(
+                query.detach(),
+                key_comp_mla,
+                topk_indices_compressed,
+                lse_indexer,
+                float(self.softmax_scale),
+            )
+            # TP: each rank has local heads; allreduce partial sums then renorm.
+            if self.tp_group is not None and getattr(self.tp_group, "nranks", 1) > 1:
+                paddle.distributed.all_reduce(target, group=self.tp_group)
+                target = target / target.sum(axis=-1, keepdim=True).clip(min=1e-10)
+            paddle.base.core.nvprof_nvtx_pop()
+
+            # KL loss
+            eps = 1e-10
+            kl_per_elem = target * (
+                paddle.log(target + eps) - paddle.log(topk_probs + eps)
+            )
+            indexer_loss = kl_per_elem.sum(axis=-1).mean() * float(indexer_loss_coeff)
+
+            if indexer_loss_coeff > 0:
+                DSAIndexerLossLoggingHelper.save_loss_to_tracker(
+                    loss=indexer_loss,
+                    layer_number=self.layer_number,
+                    num_layers=self.config.num_hidden_layers,
+                )
+
+            # Assemble complete state for auto-scaler backward.
+            complete_loss_state = (
+                q_indexer_bf,
+                weights_indexer_bf,
+                k_indexer_bf,
+                topk_indices_compressed,
+                topk_probs,
+                target,
+                float(indexer_loss_coeff),
+            )
+            output = TileLangCSAIndexerLossAutoScaler.apply(
+                output,
+                *complete_loss_state,
+            )
+        elif _need_lse_indexer and lse_indexer is None:
+            # Unfused fallback: lse_indexer unavailable, compute target via
+            # 2-pass kernel and assemble complete state.
+            from paddlefleet.tilelang_ops import csa_attn_target_reducesum
+
+            (
+                q_indexer_bf,
+                weights_indexer_bf,
+                k_indexer_bf,
+                topk_indices_compressed,
+                topk_probs,
+                indexer_loss_coeff,
+                key_comp_mla,
+            ) = tilelang_indexer_loss_state
+
+            target = csa_attn_target_reducesum(
+                query.detach(),
+                key_comp_mla,
+                topk_indices_compressed,
+                float(self.softmax_scale),
+            )
+            eps = 1e-10
+            kl_per_elem = target * (
+                paddle.log(target + eps) - paddle.log(topk_probs + eps)
+            )
+            indexer_loss = kl_per_elem.sum(axis=-1).mean() * float(indexer_loss_coeff)
+
+            if indexer_loss_coeff > 0:
+                DSAIndexerLossLoggingHelper.save_loss_to_tracker(
+                    loss=indexer_loss,
+                    layer_number=self.layer_number,
+                    num_layers=self.config.num_hidden_layers,
+                )
+            complete_loss_state = (
+                q_indexer_bf,
+                weights_indexer_bf,
+                k_indexer_bf,
+                topk_indices_compressed,
+                topk_probs,
+                target,
+                float(indexer_loss_coeff),
+            )
+            output = TileLangCSAIndexerLossAutoScaler.apply(
+                output,
+                *complete_loss_state,
+            )
+        elif tilelang_indexer_loss_state is not None and self.training:
+            # 2-pass fallback (dense loss or non-sparse-loss mode)
             output = TileLangCSAIndexerLossAutoScaler.apply(
                 output,
                 *tilelang_indexer_loss_state,
@@ -1408,3 +1560,45 @@ class CompressedSparseAttention(FleetLayer):
                 softmax_scale,
             )
         return output
+
+    def _compressed_sparse_attn_with_lse(
+        self,
+        query: Tensor,
+        kv_full: Tensor,
+        attn_sink: Tensor,
+        topk_idxs: Tensor,
+        softmax_scale: float,
+        indexer_topk: int,
+    ):
+        """Sparse attention that additionally returns lse_indexer.
+
+        topk_idxs must have layout [compressed | window]. Returns
+        (output, lse_indexer) where lse_indexer covers the compressed prefix.
+        """
+        if _resolve_csa_tilelang_switch(
+            self.config,
+            "csa_tilelang_enable_sparse_attn",
+        ):
+            from paddlefleet.tilelang_ops import csa_sparse_attn_with_indexer_lse
+
+            output, lse_indexer = csa_sparse_attn_with_indexer_lse(
+                query,
+                kv_full,
+                attn_sink.cast("float32"),
+                topk_idxs,
+                softmax_scale,
+                indexer_topk,
+            )
+        else:
+            # Unfused path: run normal attention + recompute lse_indexer
+            # by calling the 2-pass target kernel (no perf benefit in this
+            # fallback, but correctness is preserved).
+            output = unfused_compressed_sparse_attn(
+                query,
+                kv_full,
+                attn_sink.cast("float32"),
+                topk_idxs,
+                softmax_scale,
+            )
+            lse_indexer = None
+        return output, lse_indexer

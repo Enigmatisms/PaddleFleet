@@ -46,3 +46,22 @@ def sparse_attn(q, kv, attn_sink, topk_idxs, sm_scale=None):
             "Ensure paddle.enable_compat(scope={'tilelang'}) runs before import tilelang."
         )
     return out, lse
+
+
+def sparse_attn_with_indexer_lse(q, kv, attn_sink, topk_idxs, indexer_topk, sm_scale=None):
+    """Sparse attention that additionally returns lse_indexer.
+
+    topk_idxs layout must be [compressed_indices | window_indices].
+    Returns (out, lse, lse_indexer) where lse_indexer covers only the
+    compressed prefix.
+    """
+    q, kv, attn_sink, topk_idxs = _prepare_inputs(q, kv, attn_sink, topk_idxs)
+    out, lse, lse_indexer = sparse_mqa_fwd.sparse_mqa_fwd_with_indexer_lse_interface(
+        q, kv, attn_sink, topk_idxs, indexer_topk, sm_scale=sm_scale
+    )
+    if not isinstance(out, paddle.Tensor) or not isinstance(lse, paddle.Tensor):
+        raise RuntimeError(
+            f"TileLang must return Paddle tensors, got output={type(out)!r}, lse={type(lse)!r}. "
+            "Ensure paddle.enable_compat(scope={'tilelang'}) runs before import tilelang."
+        )
+    return out, lse, lse_indexer

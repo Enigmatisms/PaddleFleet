@@ -18,26 +18,31 @@ paddle.enable_compat(scope={"tilelang"}, silent=True)
 
 __all__ = [
     "csa_attn_target_reducesum",
+    "csa_attn_target_with_lse",
     "csa_indexer_bwd",
     "csa_indexer_topk_fwd",
     "csa_sparse_attn",
+    "csa_sparse_attn_with_indexer_lse",
 ]
 
 
 def __getattr__(name):
     if name in {
         "csa_attn_target_reducesum",
+        "csa_attn_target_with_lse",
         "csa_indexer_bwd",
         "csa_indexer_topk_fwd",
     }:
         from .indexer.csa_indexer import (
             csa_attn_target_reducesum,
+            csa_attn_target_with_lse,
             csa_indexer_bwd,
             csa_indexer_topk_fwd,
         )
 
         exports = {
             "csa_attn_target_reducesum": csa_attn_target_reducesum,
+            "csa_attn_target_with_lse": csa_attn_target_with_lse,
             "csa_indexer_bwd": csa_indexer_bwd,
             "csa_indexer_topk_fwd": csa_indexer_topk_fwd,
         }
@@ -48,4 +53,9 @@ def __getattr__(name):
 
         globals()[name] = csa_sparse_attn
         return csa_sparse_attn
+    if name == "csa_sparse_attn_with_indexer_lse":
+        from .compressed_sparse_attn import csa_sparse_attn_with_indexer_lse
+
+        globals()[name] = csa_sparse_attn_with_indexer_lse
+        return csa_sparse_attn_with_indexer_lse
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

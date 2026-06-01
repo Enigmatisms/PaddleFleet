@@ -35,6 +35,12 @@ def _get_csa_attn_target_reducesum_interface():
     return csa_attn_target_reducesum_interface
 
 
+def _get_csa_attn_target_with_lse_interface():
+    from .csa_attn_target import csa_attn_target_with_lse_interface
+
+    return csa_attn_target_with_lse_interface
+
+
 def _validate_indexer_inputs(index_q, index_k_comp, weights):
     if not isinstance(index_q, paddle.Tensor):
         raise TypeError(
@@ -360,3 +366,93 @@ def csa_indexer_bwd(
             "Ensure paddle.enable_compat(scope={'tilelang'}) runs before import tilelang."
         )
     return grad_q, grad_weights, grad_k_comp
+
+
+def csa_attn_target_with_lse(
+    query_mla,
+    key_comp_mla,
+    topk_indices,
+    lse_indexer,
+    softmax_scale: float,
+    block_I: int = DEFAULT_INDEXER_BLOCK,
+    num_stages: int = 0,
+    num_threads: int = 128,
+):
+    """1-pass target computation using pre-computed LSE from sparse-attn.
+
+    This replaces `csa_attn_target_reducesum` when LSE is available, avoiding
+    the 2-pass online softmax and halving the GEMM cost.
+
+    Args:
+        query_mla:    [B, S, H, D] bf16 — MLA attention query (detached)
+        key_comp_mla: [B, S_comp, D] bf16 — compressed KV
+        topk_indices: [B, S, topk] int32 — indices into key_comp_mla
+        lse_indexer:  [B, S, H] fp32 — LSE in log2 space from sparse-attn
+        softmax_scale: attention scale factor
+
+    Returns:
+        target: [B, S, topk] fp32 — L1-normalized target distribution
+    """
+    if not isinstance(query_mla, paddle.Tensor):
+        raise TypeError(
+            f"query_mla must be a paddle.Tensor, got {type(query_mla)!r}"
+        )
+    if not isinstance(key_comp_mla, paddle.Tensor):
+        raise TypeError(
+            f"key_comp_mla must be a paddle.Tensor, got {type(key_comp_mla)!r}"
+        )
+    if not isinstance(topk_indices, paddle.Tensor):
+        raise TypeError(
+            f"topk_indices must be a paddle.Tensor, got {type(topk_indices)!r}"
+        )
+    if not isinstance(lse_indexer, paddle.Tensor):
+        raise TypeError(
+            f"lse_indexer must be a paddle.Tensor, got {type(lse_indexer)!r}"
+        )
+    if len(query_mla.shape) != 4:
+        raise ValueError(
+            f"query_mla must have shape [B, S, H, D], got {query_mla.shape}"
+        )
+    if len(key_comp_mla.shape) != 3:
+        raise ValueError(
+            f"key_comp_mla must have shape [B, S_comp, D], got {key_comp_mla.shape}"
+        )
+    if len(topk_indices.shape) != 3:
+        raise ValueError(
+            f"topk_indices must have shape [B, S, topk], got {topk_indices.shape}"
+        )
+    if len(lse_indexer.shape) != 3:
+        raise ValueError(
+            f"lse_indexer must have shape [B, S, H], got {lse_indexer.shape}"
+        )
+    if topk_indices.dtype != paddle.int32:
+        topk_indices = topk_indices.cast("int32")
+    topk_indices = topk_indices.contiguous()
+    if lse_indexer.dtype != paddle.float32:
+        lse_indexer = lse_indexer.cast("float32")
+    lse_indexer = lse_indexer.contiguous()
+
+    csa_attn_target_with_lse_interface = (
+        _get_csa_attn_target_with_lse_interface()
+    )
+    target = csa_attn_target_with_lse_interface(
+        query_mla.contiguous(),
+        key_comp_mla.contiguous(),
+        topk_indices,
+        lse_indexer,
+        float(softmax_scale),
+        block_I=int(block_I),
+        num_stages=int(num_stages),
+        num_threads=int(num_threads),
+    )
+    expected_shape = topk_indices.shape
+    if target.shape != expected_shape:
+        raise RuntimeError(
+            f"unexpected CSA attention target shape: target={target.shape}, expected={expected_shape}"
+        )
+    if not isinstance(target, paddle.Tensor):
+        raise RuntimeError(
+            "TileLang must return Paddle tensors. "
+            "Ensure paddle.enable_compat(scope={'tilelang'}) runs before import tilelang."
+        )
+    return target

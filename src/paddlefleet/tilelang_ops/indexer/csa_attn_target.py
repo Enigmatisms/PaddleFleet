@@ -348,3 +348,240 @@ def csa_attn_target_reducesum_interface(
     target = paddle.where(valid, target, paddle.zeros_like(target))
     target = target / target.sum(axis=-1, keepdim=True).clip(min=1e-10)
     return paddle.where(valid, target, paddle.zeros_like(target))
+
+
+# ---------------------------------------------------------------------------
+# 1-pass target kernel: uses pre-computed LSE from sparse-attn forward.
+# ---------------------------------------------------------------------------
+
+
+@tilelang.jit(
+    pass_configs={
+        tilelang.PassConfigKey.TL_DISABLE_TMA_LOWER: True,
+        tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True,
+    }
+)
+def tl_csa_attn_target_with_lse(
+    heads: int,
+    dim: int,
+    topk: int,
+    block_I: int = 32,
+    dtype: str = "bfloat16",
+    num_stages: int = 0,
+    num_threads: int = 128,
+):
+    """1-pass target kernel: given LSE (log2 space), compute target in one pass.
+
+    Unlike the 2-pass version, this kernel does NOT compute its own softmax
+    normalization. Instead it consumes lse_indexer from the sparse-attn forward
+    and directly computes:
+        prob[h, k] = exp2(Q_h·K_k^T * sm_scale_log2e - lse_indexer[h])
+        target[k] = sum_h prob[h, k]
+    Followed by L1 normalization at the interface level.
+    """
+    assert num_stages == 0
+    assert dim == tilelang.math.next_power_of_2(dim)
+    assert topk % block_I == 0
+    assert heads > 0
+
+    if heads > 64:
+        assert heads % 64 == 0
+        replicate_h = heads // 64
+    else:
+        replicate_h = 1
+    padded_h = max(tilelang.math.next_power_of_2(heads), 16)
+    h_per_block = padded_h if replicate_h == 1 else 64
+
+    batch = T.dynamic("batch")
+    seq_len = T.dynamic("seq_len")
+    seq_len_comp = T.dynamic("seq_len_comp")
+
+    FP32 = "float"
+    INT32 = "int32"
+
+    query_shape = [batch, seq_len, heads, dim]
+    key_shape = [batch, seq_len_comp, dim]
+    topk_indices_shape = [batch, seq_len, topk]
+    lse_shape = [batch, seq_len, heads]
+    partial_shape = [batch, seq_len, replicate_h, topk]
+
+    @T.prim_func
+    def target_kernel_with_lse(
+        Query: T.Tensor(query_shape, dtype),
+        KeyComp: T.Tensor(key_shape, dtype),
+        TopkIndices: T.Tensor(topk_indices_shape, INT32),
+        SmScaleLog2e: T.Tensor([1], FP32),
+        LseIndexer: T.Tensor(lse_shape, FP32),
+        PartialReduceSum: T.Tensor(partial_shape, FP32),
+    ):
+        with T.Kernel(seq_len * replicate_h, batch, threads=num_threads) as (
+            bx,
+            by,
+        ):
+            s_i = bx if replicate_h == 1 else bx // replicate_h
+            r_i = bx % replicate_h
+            h_base = 0 if replicate_h == 1 else r_i * 64
+
+            query_shared = T.alloc_shared([h_per_block, dim], dtype=dtype)
+            key_shared = T.alloc_shared([block_I, dim], dtype=dtype)
+            indices_shared = T.alloc_shared([block_I], dtype=INT32)
+            safe_indices_shared = T.alloc_shared([block_I], dtype=INT32)
+
+            logits = T.alloc_fragment([h_per_block, block_I], dtype=FP32)
+            lse_local = T.alloc_fragment([h_per_block], dtype=FP32)
+            reduce_sum = T.alloc_fragment([block_I], dtype=FP32)
+
+            # Load query tile
+            for h_i, d_i in T.Parallel(h_per_block, dim):
+                query_shared[h_i, d_i] = T.if_then_else(
+                    h_base + h_i < heads,
+                    Query[by, s_i, h_base + h_i, d_i],
+                    0,
+                )
+
+            # Load lse_indexer (log2 space from sparse-attn kernel)
+            for h_i in T.Parallel(h_per_block):
+                lse_local[h_i] = T.if_then_else(
+                    h_base + h_i < heads,
+                    LseIndexer[by, s_i, h_base + h_i],
+                    0,
+                )
+            T.sync_threads()
+
+            # Single pass: compute exp2(logits * sm_scale_log2e - lse) and
+            # reduce over heads.
+            num_blocks = T.ceildiv(topk, block_I)
+            for block_idx in T.Pipelined(num_blocks, num_stages=num_stages):
+                for i in T.Parallel(block_I):
+                    indices_shared[i] = TopkIndices[
+                        by, s_i, block_idx * block_I + i
+                    ]
+                    safe_indices_shared[i] = T.if_then_else(
+                        (indices_shared[i] >= 0)
+                        & (indices_shared[i] < seq_len_comp),
+                        indices_shared[i],
+                        0,
+                    )
+                T.sync_threads()
+
+                for i, d_i in T.Parallel(block_I, dim):
+                    key_shared[i, d_i] = T.if_then_else(
+                        (indices_shared[i] >= 0)
+                        & (indices_shared[i] < seq_len_comp),
+                        KeyComp[by, safe_indices_shared[i], d_i],
+                        0,
+                    )
+                T.sync_threads()
+
+                T.gemm(
+                    query_shared,
+                    key_shared,
+                    logits,
+                    transpose_A=False,
+                    transpose_B=True,
+                    clear_accum=True,
+                )
+
+                # prob[h,k] = exp2(logit[h,k] * sm_scale_log2e - lse[h])
+                for h_i, i in T.Parallel(h_per_block, block_I):
+                    logits[h_i, i] = T.if_then_else(
+                        ((h_base + h_i) < heads)
+                        & (indices_shared[i] >= 0)
+                        & (indices_shared[i] < seq_len_comp),
+                        T.exp2(
+                            logits[h_i, i] * SmScaleLog2e[0] - lse_local[h_i]
+                        ),
+                        0,
+                    )
+
+                # Reduce over heads → target[k]
+                T.fill(reduce_sum, 0)
+                T.reduce_sum(logits, reduce_sum, dim=0, clear=False)
+                T.copy(
+                    reduce_sum,
+                    PartialReduceSum[
+                        by,
+                        s_i,
+                        r_i,
+                        block_idx * block_I : block_idx * block_I + block_I,
+                    ],
+                )
+
+    return target_kernel_with_lse
+
+
+def csa_attn_target_with_lse_interface(
+    query,
+    key_comp,
+    topk_indices,
+    lse_indexer,
+    softmax_scale: float,
+    block_I: int = 32,
+    num_stages: int = 0,
+    num_threads: int = 128,
+):
+    """1-pass target computation using pre-computed LSE.
+
+    Args:
+        query:        [B, S, H, D] bf16 — attention query
+        key_comp:     [B, S_comp, D] bf16 — compressed KV
+        topk_indices: [B, S, topk] int32 — indices into key_comp
+        lse_indexer:  [B, S, H] fp32 — LSE in log2 space (from sparse-attn)
+        softmax_scale: attention scale factor
+
+    Returns:
+        target: [B, S, topk] fp32 — L1-normalized target distribution
+    """
+    _validate_interface_inputs(
+        query,
+        key_comp,
+        topk_indices,
+        block_I,
+        num_stages,
+    )
+    if not isinstance(lse_indexer, paddle.Tensor):
+        raise TypeError(
+            f"lse_indexer must be a paddle.Tensor, got {type(lse_indexer)!r}"
+        )
+    if lse_indexer.ndim != 3:
+        raise ValueError(
+            f"lse_indexer must have shape [B, S, H], got {tuple(lse_indexer.shape)}"
+        )
+
+    batch, seq_len, heads, dim = query.shape
+    topk_effective = topk_indices.shape[-1]
+
+    padded_topk = (topk_effective + block_I - 1) // block_I * block_I
+    if padded_topk != topk_effective:
+        pad = paddle.full(
+            [batch, seq_len, padded_topk - topk_effective],
+            -1,
+            dtype=topk_indices.dtype,
+        )
+        topk_indices = paddle.concat([topk_indices, pad], axis=-1).contiguous()
+
+    replicate_h = heads // 64 if heads > 64 else 1
+    kernel = tl_csa_attn_target_with_lse(
+        heads=heads,
+        dim=dim,
+        topk=padded_topk,
+        block_I=block_I,
+        dtype=_tilelang_dtype(query),
+        num_stages=num_stages,
+        num_threads=num_threads,
+    )
+    partial = paddle.empty(
+        [batch, seq_len, replicate_h, padded_topk],
+        dtype="float32",
+    )
+    # sm_scale in log2 space (matching sparse-attn kernel convention)
+    sm_scale_log2e = paddle.full(
+        [1], float(softmax_scale) * 1.44269504, dtype="float32"
+    )
+    kernel(query, key_comp, topk_indices, sm_scale_log2e, lse_indexer, partial)
+
+    valid = topk_indices[:, :, :topk_effective] >= 0
+    target = partial[:, :, :, :topk_effective].sum(axis=2)
+    target = paddle.where(valid, target, paddle.zeros_like(target))
+    target = target / target.sum(axis=-1, keepdim=True).clip(min=1e-10)
+    return paddle.where(valid, target, paddle.zeros_like(target))

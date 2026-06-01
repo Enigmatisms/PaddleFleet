@@ -18,6 +18,7 @@ from .attn import sparse_mqa_bwd
 from .attn.sparse_mqa import (
     _prepare_inputs,
     sparse_attn,
+    sparse_attn_with_indexer_lse,
 )
 
 
@@ -85,4 +86,86 @@ def csa_sparse_attn(
         attn_sink,
         topk_idxs,
         softmax_scale,
+    )
+
+
+class CSASparseAttentionWithIndexerLse(paddle.autograd.PyLayer):
+    """Sparse attention PyLayer that additionally returns lse_indexer.
+
+    topk_idxs must have layout [compressed_indices | window_indices].
+    Returns (output, lse_indexer) where lse_indexer covers only the
+    compressed prefix (for 1-pass indexer target computation).
+    """
+
+    @staticmethod
+    def forward(ctx, query, kv_full, attn_sink, topk_idxs, softmax_scale, indexer_topk):
+        b, sq, np_heads, hn = query.shape
+        ctx.query_shape = (b, sq, np_heads, hn)
+        ctx.softmax_scale = float(softmax_scale)
+        ctx.attn_sink_dtype = attn_sink.dtype
+        query, kv_full, attn_sink, topk_idxs = _prepare_inputs(
+            query,
+            kv_full,
+            attn_sink,
+            topk_idxs,
+        )
+        output, lse, lse_indexer = sparse_attn_with_indexer_lse(
+            query,
+            kv_full,
+            attn_sink,
+            topk_idxs,
+            int(indexer_topk),
+            sm_scale=ctx.softmax_scale,
+        )
+        ctx.save_for_backward(query, kv_full, attn_sink, topk_idxs, output, lse)
+        return output.reshape([b, sq, np_heads * hn]), lse_indexer
+
+    @staticmethod
+    def backward(ctx, grad_output, grad_lse_indexer):
+        query, kv_full, attn_sink, topk_idxs, output, lse = ctx.saved_tensor()
+        b, sq, np_heads, hn = ctx.query_shape
+        grad_output = grad_output.reshape([b, sq, np_heads, hn])
+        dq, dkv, d_attn_sink = sparse_mqa_bwd.sparse_mqa_bwd_interface(
+            query,
+            kv_full,
+            attn_sink,
+            output,
+            grad_output,
+            topk_idxs,
+            lse,
+            ctx.softmax_scale,
+        )
+        dq = dq.reshape(query.shape)
+        dkv = dkv.reshape(kv_full.shape)
+        d_attn_sink = d_attn_sink.reshape(attn_sink.shape).cast(
+            ctx.attn_sink_dtype
+        )
+        return (
+            dq,
+            dkv,
+            d_attn_sink,
+            None,
+        )
+
+
+def csa_sparse_attn_with_indexer_lse(
+    query,
+    kv_full,
+    attn_sink,
+    topk_idxs,
+    softmax_scale,
+    indexer_topk,
+):
+    """Sparse attention returning (output, lse_indexer).
+
+    topk_idxs layout: [compressed_indices | window_indices].
+    lse_indexer: [B, S, H] fp32, LSE over compressed prefix only.
+    """
+    return CSASparseAttentionWithIndexerLse.apply(
+        query,
+        kv_full,
+        attn_sink,
+        topk_idxs,
+        softmax_scale,
+        indexer_topk,
     )
