@@ -917,6 +917,7 @@ class CSAIndexer(nn.Layer):
         b, sq, _ = x.shape
 
         # Q path
+        paddle.base.core.nvprof_nvtx_push("indexer_q")  # [TMP PROFILE]
         q, _ = self.linear_wq_b(qr)  # [b, sq, n_heads * head_dim]
         q = q.reshape([b, sq, self.index_n_heads, self.index_head_dim])
         if self.rotary_pos_emb is not None and self.qk_pos_emb_head_dim > 0:
@@ -930,13 +931,18 @@ class CSAIndexer(nn.Layer):
                 ratio=1,
             )
         q = rotate_activation(q)
+        paddle.base.core.nvprof_nvtx_pop()  # [TMP PROFILE] indexer_q
 
         # K path: own compressor (already applies RoPE and rotation internally)
+        paddle.base.core.nvprof_nvtx_push("indexer_k")  # [TMP PROFILE]
         k = self.compressor(x)  # [b, n_compressed, index_head_dim]
+        paddle.base.core.nvprof_nvtx_pop()  # [TMP PROFILE] indexer_k
 
         # Weights
+        paddle.base.core.nvprof_nvtx_push("indexer_weights")  # [TMP PROFILE]
         weights, _ = self.linear_weights_proj(x)  # [b, sq, n_heads]
         weights = weights * (self.index_n_heads**-0.5)
+        paddle.base.core.nvprof_nvtx_pop()  # [TMP PROFILE] indexer_weights
 
         return q, k, weights
 
@@ -1095,12 +1101,14 @@ class CompressedSparseAttention(FleetLayer):
             n_compressed,
         )
 
+        paddle.base.core.nvprof_nvtx_push("indexer_causal_mask")
         causal_mask = _build_compressed_causal_mask(
             self.compress_ratio,
             b,
             sq,
             n_compressed,
         )
+        paddle.base.core.nvprof_nvtx_pop()
 
         if use_tilelang_loss_path:
             # Fused TileLang fwd + selected-set KL + TileLang bwd. The returned
@@ -1109,12 +1117,15 @@ class CompressedSparseAttention(FleetLayer):
             indexer_loss_coeff = getattr(
                 self.config, "dsa_indexer_loss_coeff", 0.0
             )
+            paddle.base.core.nvprof_nvtx_push("indexer_before_topk")
             q_indexer_bf, k_indexer_bf, weights_indexer_bf = (
                 self.indexer.forward_before_topk(x_det, qr_det)
             )
+            paddle.base.core.nvprof_nvtx_pop()
             # compressed_kv is shared across query heads; pass it directly to
             # the target/reducesum path instead of materializing [B,S,H,D].
             key_comp_mla = compressed_kv.detach()
+            paddle.base.core.nvprof_nvtx_push("indexer_loss_fwd")
             (
                 indexer_loss,
                 topk_indices_compressed,
@@ -1132,6 +1143,7 @@ class CompressedSparseAttention(FleetLayer):
                 float(indexer_loss_coeff),
                 self.tp_group,
             )
+            paddle.base.core.nvprof_nvtx_pop()
             tilelang_indexer_loss_state = (
                 q_indexer_bf,
                 weights_indexer_bf,
@@ -1148,9 +1160,11 @@ class CompressedSparseAttention(FleetLayer):
                     num_layers=self.config.num_hidden_layers,
                 )
         elif self.training and not use_tilelang_indexer:
+            paddle.base.core.nvprof_nvtx_push("indexer_before_topk")
             q_indexer, k_indexer, weights_indexer = (
                 self.indexer.forward_before_topk(x_det, qr_det)
             )
+            paddle.base.core.nvprof_nvtx_pop()
             indexer_loss_coeff = getattr(
                 self.config, "dsa_indexer_loss_coeff", 0.0
             )
@@ -1172,6 +1186,7 @@ class CompressedSparseAttention(FleetLayer):
             query_sf = query.transpose([1, 0, 2, 3]).detach()
             mask_for_loss = causal_mask.unsqueeze(1)
 
+            paddle.base.core.nvprof_nvtx_push("indexer_loss_fwd")
             indexer_loss = FusedDSAIndexerLoss.apply(
                 q_sf,
                 weights_sf,
@@ -1186,6 +1201,7 @@ class CompressedSparseAttention(FleetLayer):
                 self.tp_group,
             )
             topk_indices_compressed = FusedDSAIndexerLoss._last_topk_indices
+            paddle.base.core.nvprof_nvtx_pop()
 
             if indexer_loss_coeff > 0:
                 DSAIndexerLossLoggingHelper.save_loss_to_tracker(
@@ -1194,11 +1210,13 @@ class CompressedSparseAttention(FleetLayer):
                     num_layers=self.config.num_hidden_layers,
                 )
         elif not use_tilelang_indexer:
+            paddle.base.core.nvprof_nvtx_push("indexer_topk")
             _, topk_indices_compressed = self.indexer(
                 x_det,
                 qr_det,
                 mask=causal_mask,
             )
+            paddle.base.core.nvprof_nvtx_pop()
 
         # Optionally replace topk producer with TileLang fused compressed
         # indexer forward. This only swaps the indices fed to sparse attention.
@@ -1208,9 +1226,12 @@ class CompressedSparseAttention(FleetLayer):
             )
 
             with paddle.no_grad():
+                paddle.base.core.nvprof_nvtx_push("indexer_before_topk")
                 q_indexer_tl, k_indexer_tl, weights_indexer_tl = (
                     self.indexer.forward_before_topk(x_det, qr_det)
                 )
+                paddle.base.core.nvprof_nvtx_pop()
+                paddle.base.core.nvprof_nvtx_push("indexer_topk")
                 tl_topk_indices, _tl_topk_scores = csa_indexer_topk_fwd(
                     q_indexer_tl,
                     k_indexer_tl,
@@ -1218,6 +1239,7 @@ class CompressedSparseAttention(FleetLayer):
                     ratio=self.compress_ratio,
                     topk_effective=attn_topk_effective,
                 )
+                paddle.base.core.nvprof_nvtx_pop()
 
             topk_indices_compressed = tl_topk_indices
 
@@ -1226,12 +1248,14 @@ class CompressedSparseAttention(FleetLayer):
                 ..., :attn_topk_effective
             ].contiguous()
 
+        paddle.base.core.nvprof_nvtx_push("indexer_map_kv")
         compress_topk_idxs = _map_compressed_topk_to_kv_full(
             topk_indices_compressed,
             sq,
             self.compress_ratio,
             offset,
         )
+        paddle.base.core.nvprof_nvtx_pop()
 
         return compress_topk_idxs, indexer_loss, tilelang_indexer_loss_state
 
