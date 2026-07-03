@@ -1419,6 +1419,14 @@ def cp_flashmask_swa_p2p_backward(
         key, value, recv_key, recv_value, group
     )
 
+    if startend_row_indices is not None:
+        flashmask_info = FlashMaskInfoPaddle(
+            startend_row_indices=startend_row_indices,
+            is_causal=causal,
+        )
+    else:
+        flashmask_info = None
+
     query_grad, key_grad_tensor, value_grad_tensor, grad_sink = _flash_attn_bwd(
         query,
         key_tensor,
@@ -1426,7 +1434,7 @@ def cp_flashmask_swa_p2p_backward(
         output,
         output_grad,
         log_sum_exp,
-        flashmask_info=startend_row_indices,
+        flashmask_info=flashmask_info,
         learnable_sink=learnable_sink,
         causal=causal,
         softmax_scale=softmax_scale,
@@ -1461,7 +1469,7 @@ class FlashMaskSwaP2P(PyLayer):
         learnable_sink=None,
         softmax_scale=None,
         group=None,
-        mode="contiguous_allgather",
+        mode="contiguous_swap2p",
         window_size=None,
     ):
         """Forward pass for SWA P2P FlashMask attention."""

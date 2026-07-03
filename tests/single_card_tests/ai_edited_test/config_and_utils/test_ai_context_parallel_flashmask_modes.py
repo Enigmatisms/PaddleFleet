@@ -709,6 +709,11 @@ class TestFlashMaskSwaP2PPath(unittest.TestCase):
         value_grad = self.value + 3
         captured = {}
 
+        class FakeFlashMaskInfo:
+            def __init__(self, startend_row_indices, is_causal):
+                self.startend_row_indices = startend_row_indices
+                self.is_causal = is_causal
+
         def fake_flash_bwd(query, key, value, out, dout, lse_arg, **kwargs):
             captured["key"] = key
             captured["value"] = value
@@ -736,6 +741,9 @@ class TestFlashMaskSwaP2PPath(unittest.TestCase):
             patch.object(
                 cp_utils, "_flash_attn_bwd", fake_flash_bwd, create=True
             ),
+            patch.object(
+                cp_utils, "FlashMaskInfoPaddle", FakeFlashMaskInfo, create=True
+            ),
         ):
             qg, kg, vg, grad_sink = cp_utils.cp_flashmask_swa_p2p_backward(
                 self.query,
@@ -762,7 +770,8 @@ class TestFlashMaskSwaP2PPath(unittest.TestCase):
         self.assertIs(captured["output"], output)
         self.assertIs(captured["output_grad"], output_grad)
         self.assertIs(captured["lse"], lse)
-        self.assertIs(captured["indices"], self.indices)
+        self.assertIs(captured["indices"].startend_row_indices, self.indices)
+        self.assertFalse(captured["indices"].is_causal)
         self.assertIsNone(captured["learnable_sink"])
         self.assertEqual(captured["softmax_scale"], 0.5)
         self.assertFalse(captured["deterministic"])
