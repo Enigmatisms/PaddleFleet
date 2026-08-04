@@ -473,6 +473,7 @@ class MultiTokenPredictionLayer(FleetLayer):
         hidden_states: paddle.Tensor,
         decoder_input: paddle.Tensor,
         mtp_hidden_inputs_mask: paddle.Tensor | None = None,
+        cp_balance_buckets: paddle.Tensor | None = None,
     ):
         """
         Concatenate the tokens before sending to transformer layer.
@@ -506,6 +507,7 @@ class MultiTokenPredictionLayer(FleetLayer):
                         mtp_hidden_inputs_mask,
                         axis=1,
                         mode=self.config.cp_balance_mode,
+                        buckets=cp_balance_buckets,
                     )
                 # when sp enable
                 if self.sequence_parallel:
@@ -569,6 +571,7 @@ class MultiTokenPredictionLayer(FleetLayer):
                         mtp_hidden_inputs_mask,
                         axis=1,
                         mode=self.config.cp_balance_mode,
+                        buckets=cp_balance_buckets,
                     )
 
                 # when sp enable
@@ -633,6 +636,7 @@ class MultiTokenPredictionLayer(FleetLayer):
         mtp_hidden_inputs_mask: paddle.Tensor | None = None,
         input_ids: paddle.Tensor | None = None,
         position_ids: paddle.Tensor | None = None,
+        cp_balance_buckets: paddle.Tensor | None = None,
         **kwargs,
     ) -> paddle.Tensor:
         """
@@ -645,7 +649,10 @@ class MultiTokenPredictionLayer(FleetLayer):
 
         with rng_context:
             hidden_states = self._concat_embeddings(
-                hidden_states, decoder_input, mtp_hidden_inputs_mask
+                hidden_states,
+                decoder_input,
+                mtp_hidden_inputs_mask,
+                cp_balance_buckets,
             )
 
             input_dict = {
@@ -665,6 +672,7 @@ class MultiTokenPredictionLayer(FleetLayer):
                 "is_mtp": True,
                 "input_ids": input_ids,
                 "position_ids": position_ids,
+                "cp_balance_buckets": cp_balance_buckets,
             }
             rst_dict = self.transformer_layer(input_dict)
 
@@ -727,6 +735,7 @@ class MultiTokenPredictionLayer(FleetLayer):
             packed_seq_params = kwargs.get("packed_seq_params", None)
             mtp_hidden_inputs_mask = kwargs.get("mtp_hidden_inputs_mask", None)
             input_ids = kwargs.get("input_ids", None)
+            cp_balance_buckets = kwargs.get("cp_balance_buckets", None)
             position_ids = None
             if self.config.gpt_model_use_experimental_version:
                 position_ids = kwargs.get("position_ids", None)
@@ -775,6 +784,7 @@ class MultiTokenPredictionLayer(FleetLayer):
                 else None,
                 input_ids=input_ids if input_ids is not None else None,
                 position_ids=position_ids if position_ids is not None else None,
+                cp_balance_buckets=cp_balance_buckets,
             )
 
         if self.config.recompute_method == "uniform":
@@ -880,7 +890,10 @@ class MultiTokenPredictionLayer(FleetLayer):
             # CP/SP scatter
             if cp_world_size > 1 and self.config.experimental_dataflow:
                 decoder_input = ContextParallelScatterOp.apply(
-                    decoder_input, axis=1, mode=self.config.cp_balance_mode
+                    decoder_input,
+                    axis=1,
+                    mode=self.config.cp_balance_mode,
+                    buckets=dict_args.get("cp_balance_buckets", None),
                 )
             if self.config.sequence_parallel:
                 batch_size, local_seq_len, hidden_size = decoder_input.shape
@@ -932,7 +945,10 @@ class MultiTokenPredictionLayer(FleetLayer):
 
             mtp_mask = None
             if mtp_startend_row_indices_all is not None:
-                if self.config.gpt_model_use_experimental_version:
+                # balanceq masks are already localized to D=2 and must be kept whole.
+                if self.config.gpt_model_use_experimental_version or (
+                    dict_args.get("cp_balance_buckets", None) is not None
+                ):
                     mtp_mask = mtp_startend_row_indices_all[
                         :, depth : depth + 1, :, :
                     ]
@@ -1023,7 +1039,12 @@ class MultiTokenPredictionLayer(FleetLayer):
             if "input_ids" in dict_args:
                 new_args["input_ids"] = dict_args["input_ids"]
             # Forward position_ids, attention_bias, blocks if present
-            for extra_key in ("position_ids", "attention_bias", "blocks"):
+            for extra_key in (
+                "position_ids",
+                "attention_bias",
+                "blocks",
+                "cp_balance_buckets",
+            ):
                 if extra_key in dict_args and dict_args[extra_key] is not None:
                     new_args[extra_key] = dict_args[extra_key]
 
@@ -1212,7 +1233,10 @@ class MultiTokenPredictionLayer(FleetLayer):
             # New dataflow: get the mask for this layer's depth, shape [B, 1, S, 1]
             mtp_mask = None
             if mtp_startend_row_indices_all is not None:
-                if self.config.gpt_model_use_experimental_version:
+                # balanceq masks are already localized to D=2 and must be kept whole.
+                if self.config.gpt_model_use_experimental_version or (
+                    dict_args.get("cp_balance_buckets", None) is not None
+                ):
                     mtp_mask = mtp_startend_row_indices_all[
                         :,
                         self.layer_number : self.layer_number + 1,

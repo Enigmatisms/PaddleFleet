@@ -26,6 +26,7 @@ from paddle.distributed.fleet.meta_parallel.zero_bubble_utils import (
 )
 from paddle.distributed.fleet.utils import recompute
 
+from paddlefleet.attention_meta_info import unpack_attention_meta
 from paddlefleet.context_parallel_utils import (
     ContextParallelAllGatherOp,
     ContextParallelScatterOp,
@@ -189,6 +190,7 @@ def _ec_compatible_rope_apply(
     position_offset=0,
     position_ids=None,
     cp_balance_mode="dualchunk_allgather",
+    cp_balance_buckets=None,
 ):
     """Apply RoPE using EC's complex multiplication method (no YaRN, no mscale).
 
@@ -240,7 +242,7 @@ def _ec_compatible_rope_apply(
         # In EB dataflow and CP size > 1, freqs_cis is [b, s/cp, 1, d] in local
         # so, we need to scatter freqs_cis here
         freqs_cis = ContextParallelScatterOp.apply(
-            freqs_cis, axis=1, mode=cp_balance_mode
+            freqs_cis, axis=1, mode=cp_balance_mode, buckets=cp_balance_buckets
         )
 
     # MD5 debug
@@ -774,6 +776,10 @@ class MultiLatentAttention(Attention):
             "MLA does not support Flash Decoding"
         )
 
+        attn_mask_startend_row_indices, cp_balance_buckets = (
+            unpack_attention_meta(attn_mask_startend_row_indices)
+        )
+
         # =====================
         # Query, Key, and Value
         # =====================
@@ -785,6 +791,7 @@ class MultiLatentAttention(Attention):
                 key_value_states,
                 position_ids,
                 packed_seq_params,
+                cp_balance_buckets,
             )
         )
 
@@ -828,6 +835,14 @@ class MultiLatentAttention(Attention):
             q_absorbed, wv_b = self._compute_absorbed_q(query)
         else:
             q_absorbed, wv_b = None, None
+
+        # Only pass the balanceq buckets when present: sibling core_attention
+        # implementations do not accept this kwarg.
+        cp_kwargs = (
+            {}
+            if cp_balance_buckets is None
+            else {"cp_balance_buckets": cp_balance_buckets}
+        )
 
         hy_sparse_full = (
             self.config.enable_hy_sparse_attention and shared_kv is not None
@@ -895,6 +910,7 @@ class MultiLatentAttention(Attention):
                 k_pos_emb=k_pos_emb,
                 q_absorbed=q_absorbed,
                 v_b_proj_weight=wv_b,
+                **cp_kwargs,
             )
         else:
             # Static batching attention kernel.
@@ -920,6 +936,7 @@ class MultiLatentAttention(Attention):
                 k_pos_emb=k_pos_emb,
                 q_absorbed=q_absorbed,
                 v_b_proj_weight=wv_b,
+                **cp_kwargs,
             )
 
         if self.recompute_qkv_up_porj_and_rope and self.training:
@@ -1409,6 +1426,7 @@ class MLASelfAttention(MultiLatentAttention):
         key_value_states=None,
         position_ids=None,
         packed_seq_params=None,
+        cp_balance_buckets=None,
     ):
         """
         Derives `query`, `key` and `value` tensors from `hidden_states`.
@@ -1508,10 +1526,16 @@ class MLASelfAttention(MultiLatentAttention):
                         f"rotary_seq_len={rotary_seq_len}."
                     )
                 rotary_pos_cos = ContextParallelScatterOp.apply(
-                    rotary_pos_cos, axis=1, mode=self.config.cp_balance_mode
+                    rotary_pos_cos,
+                    axis=1,
+                    mode=self.config.cp_balance_mode,
+                    buckets=cp_balance_buckets,
                 ).contiguous()
                 rotary_pos_sin = ContextParallelScatterOp.apply(
-                    rotary_pos_sin, axis=1, mode=self.config.cp_balance_mode
+                    rotary_pos_sin,
+                    axis=1,
+                    mode=self.config.cp_balance_mode,
+                    buckets=cp_balance_buckets,
                 ).contiguous()
             elif rotary_pos_emb is not None:
                 if rotary_pos_emb.shape[1] != rotary_seq_len:
@@ -1522,7 +1546,10 @@ class MLASelfAttention(MultiLatentAttention):
                         f"rotary_seq_len={rotary_seq_len}."
                     )
                 rotary_pos_emb = ContextParallelScatterOp.apply(
-                    rotary_pos_emb, axis=1, mode=self.config.cp_balance_mode
+                    rotary_pos_emb,
+                    axis=1,
+                    mode=self.config.cp_balance_mode,
+                    buckets=cp_balance_buckets,
                 )
             else:
                 raise ValueError(
@@ -1856,6 +1883,7 @@ class MLASelfAttention(MultiLatentAttention):
                         position_offset=start_pos,
                         position_ids=position_ids,
                         cp_balance_mode=self.config.cp_balance_mode,
+                        cp_balance_buckets=cp_balance_buckets,
                     )
                     _log(q_pos_emb, "mla_q_pe_after_rope", self.layer_number)
                     _log(k_pos_emb, "mla_k_pe_after_rope", self.layer_number)
@@ -2437,6 +2465,7 @@ class MQASelfAttention(MLASelfAttention):
         key_value_states=None,
         position_ids=None,
         packed_seq_params=None,
+        cp_balance_buckets=None,
     ):
         """
         Derives `query`, `key` and `value` tensors from `hidden_states`.
@@ -2447,6 +2476,7 @@ class MQASelfAttention(MLASelfAttention):
                 key_value_states=key_value_states,
                 position_ids=position_ids,
                 packed_seq_params=packed_seq_params,
+                cp_balance_buckets=cp_balance_buckets,
             )
 
         # b = batch size, s = sequence length, h = hidden size, n = num attention heads

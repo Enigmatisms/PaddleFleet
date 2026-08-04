@@ -547,6 +547,7 @@ class StandardMoERouter(nn.Layer):
         batch_size,
         input_ids=None,
         origin_input_ids=None,
+        cp_balance_buckets=None,
     ):
         if self.use_accuracy_compatible:
             _probs_2d_pf = (
@@ -652,7 +653,10 @@ class StandardMoERouter(nn.Layer):
             ):
                 # In EB data flow, we need to gather input_ids here to get right denom.
                 input_ids = ContextParallelGatherOp.apply(
-                    input_ids, axis=1, mode=self.config.cp_balance_mode
+                    input_ids,
+                    axis=1,
+                    mode=self.config.cp_balance_mode,
+                    buckets=cp_balance_buckets,
                 )
             _ids = input_ids
             if _ids.ndim == 1:
@@ -751,7 +755,7 @@ class StandardMoERouter(nn.Layer):
         return seq_aux_loss
 
     def _cal_z_loss(
-        self, logits, input_ids=None, origin_input_ids=None
+        self, logits, input_ids=None, origin_input_ids=None, cp_balance_buckets=None
     ) -> paddle.Tensor:
         """
         Calculate the z loss.
@@ -780,7 +784,10 @@ class StandardMoERouter(nn.Layer):
             ):
                 # In EB data flow, we need to gather input_ids here to get right denom.
                 gathered_input_ids = ContextParallelGatherOp.apply(
-                    gathered_input_ids, axis=1, mode=self.config.cp_balance_mode
+                    gathered_input_ids,
+                    axis=1,
+                    mode=self.config.cp_balance_mode,
+                    buckets=cp_balance_buckets,
                 )
 
             pad_token_id = getattr(self.config, "pad_token_id", 0)
@@ -1411,7 +1418,9 @@ class TopKRouter(StandardMoERouter):
         self.layer_number = layer_number
         self._setup_hash_layer(layer_number, is_mtp_layer=is_mtp_layer)
 
-    def forward(self, input, input_ids=None, origin_input_ids=None):
+    def forward(
+        self, input, input_ids=None, origin_input_ids=None, cp_balance_buckets=None
+    ):
         if len(input.shape) == 3:
             if not self.sequence_parallel:
                 batch_size, seq_len, d_model = input.shape
@@ -1426,7 +1435,10 @@ class TopKRouter(StandardMoERouter):
                 # but shape of input is [b, s/cp, h] ([s/cp, b, h] in sp),
                 # so we need to scatter input_ids here to avid the assertion below
                 input_ids = ContextParallelScatterOp.apply(
-                    input_ids, axis=1, mode=self.config.cp_balance_mode
+                    input_ids,
+                    axis=1,
+                    mode=self.config.cp_balance_mode,
+                    buckets=cp_balance_buckets,
                 )
             if input_ids is not None:
                 pad_token_id = getattr(self.config, "pad_token_id", 0)
@@ -1475,7 +1487,10 @@ class TopKRouter(StandardMoERouter):
                 # but shape of input is [b, s/cp, h] ([s/cp, b, h] in sp),
                 # so we need to scatter input_ids here to avid the assertion below
                 input_ids = ContextParallelScatterOp.apply(
-                    input_ids, axis=1, mode=self.config.cp_balance_mode
+                    input_ids,
+                    axis=1,
+                    mode=self.config.cp_balance_mode,
+                    buckets=cp_balance_buckets,
                 )
             if (
                 input_ids is not None
@@ -1715,7 +1730,9 @@ class TopKRouter(StandardMoERouter):
         # z-loss
         if self.config.router_z_loss_coef:
             l_zloss = (
-                self._cal_z_loss(logits, input_ids, origin_input_ids)
+                self._cal_z_loss(
+                    logits, input_ids, origin_input_ids, cp_balance_buckets
+                )
                 * self.config.router_z_loss_coef
             )
         else:
@@ -1793,6 +1810,7 @@ class TopKRouter(StandardMoERouter):
                     batch_size,
                     input_ids=input_ids,
                     origin_input_ids=origin_input_ids,
+                    cp_balance_buckets=cp_balance_buckets,
                 )
 
             else:

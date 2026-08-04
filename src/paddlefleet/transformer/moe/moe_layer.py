@@ -1277,6 +1277,7 @@ class MoELayer(nn.Layer):
         input_ids: paddle.Tensor | None = None,
         residual: paddle.Tensor | None = None,
         origin_input_ids: paddle.Tensor | None = None,
+        cp_balance_buckets: paddle.Tensor | None = None,
     ) -> paddle.Tensor:
         """
         Args:
@@ -1330,6 +1331,7 @@ class MoELayer(nn.Layer):
             gate_input,
             input_ids=input_ids,
             origin_input_ids=origin_input_ids,
+            cp_balance_buckets=cp_balance_buckets,
         )
         # topk_weights, topk_indices: Shape is [seq_len, moe_router_topk]
         # probs: combine weights in [S, E] sparse layout (non-selected positions are 0) [seq_len, num_experts]
@@ -1790,13 +1792,16 @@ class Gemma4TopKRouter(TopKRouter):
         h = (h / rms).cast(hidden_states.dtype)
         return h * self.router_input_scale * self._inv_sqrt_d
 
-    def forward(self, input, input_ids=None, origin_input_ids=None):
+    def forward(
+        self, input, input_ids=None, origin_input_ids=None, cp_balance_buckets=None
+    ):
         """Normalize input, then delegate to TopKRouter for full routing logic."""
         normalized_input = self._normalize_input(input)
         return super().forward(
             normalized_input,
             input_ids=input_ids,
             origin_input_ids=origin_input_ids,
+            cp_balance_buckets=cp_balance_buckets,
         )
 
 

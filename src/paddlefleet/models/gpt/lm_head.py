@@ -318,9 +318,18 @@ class GPTLMHead(ColumnParallelLinear):
             logits = [self._forward(tensor_list[0])]
             for i in range(self.config.num_nextn_predict_layers):
                 logits.append(self._forward(tensor_list[i + 1]))
-            return logits
         else:
-            return self._forward(hidden_states)
+            logits = self._forward(hidden_states)
+
+        cp_balance_buckets = dict_args.get("cp_balance_buckets", None)
+        if cp_balance_buckets is not None:
+            # balanceq: LanguageLoss needs the chunk assignment for its own CP
+            # scatter/gather ops, so hand it over alongside the logits.
+            return {
+                "logits": logits,
+                "cp_balance_buckets": cp_balance_buckets,
+            }
+        return logits
 
     @property
     def embedding_weight(self):
@@ -369,6 +378,7 @@ class GPTMainLMHead(GPTLMHead):
         ret = {
             "logits": logits,
             "mtp_loss": mtp_loss,
+            "cp_balance_buckets": dict_args.get("cp_balance_buckets", None),
         }
         # Filter out None values to avoid AttributeError in
         # convert_tensor_dict_to_tuple when pipeline stage boundary

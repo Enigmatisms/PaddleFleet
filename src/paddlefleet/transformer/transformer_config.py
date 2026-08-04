@@ -683,6 +683,9 @@ class TransformerConfig(ModelParallelConfig):
     "dualchunk_allgather": balanced front+rear chunk splitting (default).
     "contiguous_allgather": simple rank-order contiguous slicing.
     "contiguous_a2a".
+    "balanceq_allgather": FlashMask load-balanced chunk assignment; requires
+        experimental_dataflow so that the buckets can be derived from the
+        global attention mask at the dataflow entry.
     """
 
     ####################
@@ -1351,6 +1354,13 @@ class TransformerConfig(ModelParallelConfig):
                     "enable_mtp_magic_send with vpp requires variable_seq_lengths=True"
                 )
 
+        if self.cp_balance_mode == "balanceq_allgather":
+            assert self.experimental_dataflow, (
+                "cp_balance_mode=balanceq_allgather requires "
+                "experimental_dataflow=True so that the chunk assignment can "
+                "be built from the global attention mask."
+            )
+
         if self.intermediate_size is None:
             self.intermediate_size = 4 * self.hidden_size
 
@@ -1923,8 +1933,20 @@ class TransformerConfig(ModelParallelConfig):
             "dualchunk_allgather",
             "contiguous_allgather",
             "contiguous_a2a",
+            "balanceq_allgather",
         }:
             raise ValueError(
                 f"cp_balance_mode={self.cp_balance_mode!r} is invalid. "
-                "Must be one of {'dualchunk_allgather', 'contiguous_allgather', 'contiguous_a2a'}."
+                "Must be one of {'dualchunk_allgather', 'contiguous_allgather', 'contiguous_a2a', 'balanceq_allgather'}."
+            )
+
+        if (
+            self.cp_balance_mode == "balanceq_allgather"
+            and self.enable_hy_sparse_attention
+        ):
+            raise ValueError(
+                "cp_balance_mode='balanceq_allgather' does not support "
+                "enable_hy_sparse_attention: HySparse gathers KV in rank order "
+                "and selects key blocks by global position, which the balanceq "
+                "layout permutes."
             )

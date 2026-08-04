@@ -29,6 +29,9 @@ from paddle.distributed.fleet.utils.sequence_parallel_utils import (
 
 from paddlefleet.context_parallel_utils import (
     ContextParallelScatterOp,
+    build_cp_balanceq_mask,
+    is_cp_balanceq_mode,
+    localize_cp_balanceq_mask,
     mark_context_parallel_parameter_disable_scale_grad,
 )
 from paddlefleet.models.gpt.utils import fill_feature
@@ -179,6 +182,23 @@ class GPTEmbedding(FleetLayer):
             if attn_mask_startend_row_indices is not None
             else None
         )
+        # Balance the global FlashMask across CP ranks once, at the dataflow
+        # entry, so every sequence-sharded tensor below follows the same chunk
+        # assignment. Non-balanceq modes keep cp_balance_buckets None and are
+        # therefore unaffected.
+        cp_balance_buckets = None
+        if (
+            get_context_parallel_world_size() > 1
+            and self.config.experimental_dataflow
+            and is_cp_balanceq_mode(self.config.cp_balance_mode)
+        ):
+            assert attn_mask_startend_row_indices is not None, (
+                "attn_mask_startend_row_indices is required when cp_balance_mode "
+                "uses balanceq."
+            )
+            attn_mask_startend_row_indices, cp_balance_buckets = (
+                build_cp_balanceq_mask(attn_mask_startend_row_indices)
+            )
         deepstack_image_embeds = dict_args.get("deepstack_image_embeds", None)
         deepstack_video_embeds = dict_args.get("deepstack_video_embeds", None)
         visual_pos_masks = None
@@ -267,6 +287,7 @@ class GPTEmbedding(FleetLayer):
                             decoder_input,
                             axis=1,
                             mode=self.config.cp_balance_mode,
+                            buckets=cp_balance_buckets,
                         )
                     if (
                         self.config.gpt_model_use_experimental_version
@@ -313,6 +334,7 @@ class GPTEmbedding(FleetLayer):
                             inputs_embeds,
                             axis=1,
                             mode=self.config.cp_balance_mode,
+                            buckets=cp_balance_buckets,
                         )
 
                     if self.sequence_parallel:
@@ -344,6 +366,7 @@ class GPTEmbedding(FleetLayer):
                                 inputs_embeds_mtp,
                                 axis=1,
                                 mode=self.config.cp_balance_mode,
+                                buckets=cp_balance_buckets,
                             )
 
                         if self.sequence_parallel:
@@ -497,7 +520,10 @@ class GPTEmbedding(FleetLayer):
                     "generation."
                 )
                 decoder_input = ContextParallelScatterOp.apply(
-                    decoder_input, axis=1, mode=self.config.cp_balance_mode
+                    decoder_input,
+                    axis=1,
+                    mode=self.config.cp_balance_mode,
+                    buckets=cp_balance_buckets,
                 )
 
         # Rotary positional embeddings (embedding is None for PP intermediate devices)
@@ -617,27 +643,45 @@ class GPTEmbedding(FleetLayer):
         ):
             if rotary_pos_emb is not None:
                 rotary_pos_emb = ContextParallelScatterOp.apply(
-                    rotary_pos_emb, axis=1, mode=self.config.cp_balance_mode
+                    rotary_pos_emb,
+                    axis=1,
+                    mode=self.config.cp_balance_mode,
+                    buckets=cp_balance_buckets,
                 )
             if swa_rotary_pos_emb is not None:
                 swa_rotary_pos_emb = ContextParallelScatterOp.apply(
-                    swa_rotary_pos_emb, axis=1, mode=self.config.cp_balance_mode
+                    swa_rotary_pos_emb,
+                    axis=1,
+                    mode=self.config.cp_balance_mode,
+                    buckets=cp_balance_buckets,
                 )
             if rotary_pos_cos is not None:
                 rotary_pos_cos = ContextParallelScatterOp.apply(
-                    rotary_pos_cos, axis=1, mode=self.config.cp_balance_mode
+                    rotary_pos_cos,
+                    axis=1,
+                    mode=self.config.cp_balance_mode,
+                    buckets=cp_balance_buckets,
                 )
             if rotary_pos_sin is not None:
                 rotary_pos_sin = ContextParallelScatterOp.apply(
-                    rotary_pos_sin, axis=1, mode=self.config.cp_balance_mode
+                    rotary_pos_sin,
+                    axis=1,
+                    mode=self.config.cp_balance_mode,
+                    buckets=cp_balance_buckets,
                 )
             if swa_rotary_pos_cos is not None:
                 swa_rotary_pos_cos = ContextParallelScatterOp.apply(
-                    swa_rotary_pos_cos, axis=1, mode=self.config.cp_balance_mode
+                    swa_rotary_pos_cos,
+                    axis=1,
+                    mode=self.config.cp_balance_mode,
+                    buckets=cp_balance_buckets,
                 )
             if swa_rotary_pos_sin is not None:
                 swa_rotary_pos_sin = ContextParallelScatterOp.apply(
-                    swa_rotary_pos_sin, axis=1, mode=self.config.cp_balance_mode
+                    swa_rotary_pos_sin,
+                    axis=1,
+                    mode=self.config.cp_balance_mode,
+                    buckets=cp_balance_buckets,
                 )
 
         preproc_output = {
@@ -661,6 +705,7 @@ class GPTEmbedding(FleetLayer):
                 if self.config.gpt_model_use_experimental_version
                 else None
             ),
+            "cp_balance_buckets": cp_balance_buckets,
         }
         # New dataflow: pass mtp_startend_row_indices_all and mtp_hidden_inputs_mask_all
         # through dict_args to MTP layer. They must both be present or both be absent.
@@ -683,6 +728,12 @@ class GPTEmbedding(FleetLayer):
             if not mtp_startend_row_indices_all.place.is_gpu_place():
                 mtp_startend_row_indices_all = (
                     mtp_startend_row_indices_all.cuda()
+                )
+            if cp_balance_buckets is not None:
+                # Reuse the backbone assignment so MTP hidden states and masks
+                # stay consistent; the depth axis rides along as the head axis.
+                mtp_startend_row_indices_all = localize_cp_balanceq_mask(
+                    mtp_startend_row_indices_all, cp_balance_buckets
                 )
             preproc_output["mtp_startend_row_indices_all"] = (
                 mtp_startend_row_indices_all

@@ -19,8 +19,6 @@ import math
 from functools import partial
 from typing import TYPE_CHECKING
 
-import numpy as np
-
 if TYPE_CHECKING:
     from paddlefleet.packed_seq_params import PackedSeqParams
     from paddlefleet.transformer.transformer_config import TransformerConfig
@@ -36,7 +34,9 @@ from paddlefleet_ops.flash_mask_facade import (
 )
 
 from paddlefleet.context_parallel_utils import (
+    expand_cp_startend_row_indices_to_d2,
     flashmask_attention_cp,
+    is_cp_balanceq_mode,
 )
 from paddlefleet.fusions.fused_softmax import FusedScaleMaskSoftmax
 from paddlefleet.parallel_state import get_context_parallel_world_size
@@ -426,32 +426,17 @@ class DotProductAttention(FleetLayer):
                 dtype=paddle.int32,
             ).cuda()
 
-        if attn_mask_startend_row_indices.shape[-1] == 1:
-            b, k_heads, k_seqlen, _ = attn_mask_startend_row_indices.shape
-            append_indices = paddle.to_tensor(
-                np.arange(seq_len),
-                dtype=attn_mask_startend_row_indices.dtype,
-            ).cuda()
-            append_indices = append_indices.reshape(1, 1, seq_len, 1)
-            append_indices_expand = append_indices.expand(
-                b, k_heads, k_seqlen, 1
-            )
-            attn_mask_startend_row_indices = paddle.concat(
-                [attn_mask_startend_row_indices, append_indices_expand],
-                axis=-1,
-            )
-        elif (
-            attn_mask_startend_row_indices.shape[-1] == 2
-            and self.config.experimental_dataflow
-        ):
+        if attn_mask_startend_row_indices.shape[-1] == 2:
             # In EB dataflow, attn_mask_startend_row_indices.shape[-1] == 2
             # means attn_mask_startend_row_indices is ready, do not need to concat
-            pass
-        else:
-            raise ValueError(
-                "Invalid attention mask shape, when using context parallel, attn_mask_startend_row_indices.shape[-1] must be either 1 or 2"
-            )
-        return attn_mask_startend_row_indices
+            if not self.config.experimental_dataflow:
+                raise ValueError(
+                    "Invalid attention mask shape, when using context parallel, attn_mask_startend_row_indices.shape[-1] must be either 1 or 2"
+                )
+            return attn_mask_startend_row_indices
+        return expand_cp_startend_row_indices_to_d2(
+            attn_mask_startend_row_indices, seq_len
+        )
 
     def forward(
         self,
@@ -463,6 +448,7 @@ class DotProductAttention(FleetLayer):
         attn_mask_type: AttnMaskType = None,
         attention_bias: Tensor = None,
         packed_seq_params: PackedSeqParams | None = None,
+        cp_balance_buckets: Tensor | None = None,
         use_rr_flash_attention: bool = False,
         past_key_values=None,
         layer_idx=None,
@@ -484,6 +470,10 @@ class DotProductAttention(FleetLayer):
         assert not (
             use_rr_flash_attention and self.config.flashmask_use_varlen
         ), "flashmask_use_varlen does not support refined recompute now."
+        assert not (
+            use_rr_flash_attention
+            and is_cp_balanceq_mode(self.config.cp_balance_mode)
+        ), "Refined recompute CP FlashMask does not support balanceq now."
 
         use_eager = self.config._attn_implementation == "eager"
 
@@ -704,6 +694,8 @@ class DotProductAttention(FleetLayer):
                             "Disable refined_recompute or use default softmax_scale."
                         )
                 extra_kwargs["mode"] = self.config.cp_balance_mode
+                if cp_balance_buckets is not None:
+                    extra_kwargs["buckets"] = cp_balance_buckets
                 if self.config.cp_balance_mode == "contiguous_a2a":
                     if not self.config.multi_latent_attention:
                         raise NotImplementedError(

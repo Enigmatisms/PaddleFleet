@@ -32,6 +32,7 @@ from paddle.distributed.fleet.meta_parallel import LayerSpec, build_spec_layer
 from paddle.distributed.fleet.utils import recompute
 
 from paddlefleet import tensor_parallel
+from paddlefleet.attention_meta_info import unpack_attention_meta
 from paddlefleet.context_parallel_utils import ContextParallelScatterOp
 from paddlefleet.models.common.embeddings import (
     apply_rotary_pos_emb,
@@ -75,6 +76,7 @@ def _apply_ec_complex_3d_mrope(
     mrope_section=None,
     layer_number=0,
     cp_balance_mode="dualchunk_allgather",
+    cp_balance_buckets=None,
 ):
     """Apply EC-style complex multiplication 3D MRoPE to query and key tensors."""
     import logging
@@ -132,7 +134,7 @@ def _apply_ec_complex_3d_mrope(
     freqs_cis = freqs_cis.unsqueeze(2)
     if get_context_parallel_world_size() > 1:
         freqs_cis = ContextParallelScatterOp.apply(
-            freqs_cis, axis=1, mode=cp_balance_mode
+            freqs_cis, axis=1, mode=cp_balance_mode, buckets=cp_balance_buckets
         )
     if _LOG_LAYER_MD5:
         logger = logging.getLogger(__name__)
@@ -477,6 +479,10 @@ class Attention(FleetLayer, ABC):
             (tuple[Tensor, Tensor]) Attention output and bias.
 
         """
+        attn_mask_startend_row_indices, cp_balance_buckets = (
+            unpack_attention_meta(attn_mask_startend_row_indices)
+        )
+
         # Check if we need to skip RoPE
         # no_rope is 0-indexed array and self.layer_number is 1-indexed
         # no_rope = (
@@ -553,6 +559,7 @@ class Attention(FleetLayer, ABC):
                 mrope_section=getattr(self.config, "mrope_section", [16, 1, 1]),
                 layer_number=self.layer_number,
                 cp_balance_mode=self.config.cp_balance_mode,
+                cp_balance_buckets=cp_balance_buckets,
             )
         elif rope_freqs_cis is not None:
             rope_freqs_cis = rope_freqs_cis.unsqueeze(-2)  # ..., 1, head_dim/2
@@ -691,6 +698,13 @@ class Attention(FleetLayer, ABC):
                         min=0,
                     ).astype(paddle.int32)
 
+        # Only pass the balanceq buckets when present: sibling core_attention
+        # implementations do not accept this kwarg.
+        cp_kwargs = (
+            {}
+            if cp_balance_buckets is None
+            else {"cp_balance_buckets": cp_balance_buckets}
+        )
         if self.recompute_core_attention and self.training:
             core_attn_out = recompute(
                 self.core_attention,
@@ -705,6 +719,7 @@ class Attention(FleetLayer, ABC):
                 attention_bias=attention_bias,
                 packed_seq_params=packed_seq_params,
                 use_rr_flash_attention=self.use_rr_flash_attention,
+                **cp_kwargs,
             )
         else:
             # Static batching attention kernel.
@@ -722,6 +737,7 @@ class Attention(FleetLayer, ABC):
                 past_key_values=past_key_values,
                 layer_idx=layer_idx,
                 use_cache=use_cache,
+                **cp_kwargs,
             )
         # =================
         # Output. [b, sq, h]
@@ -1703,6 +1719,15 @@ class SelfAttentionVHA(Attention):
             rotary_pos_cos = swa_rotary_pos_cos
             rotary_pos_sin = swa_rotary_pos_sin
 
+        attn_mask_startend_row_indices, cp_balance_buckets = (
+            unpack_attention_meta(attn_mask_startend_row_indices)
+        )
+        cp_kwargs = (
+            {}
+            if cp_balance_buckets is None
+            else {"cp_balance_buckets": cp_balance_buckets}
+        )
+
         # hidden_states: [b, sq, h]
 
         # For self attention we just duplicate the rotary_pos_emb if it isn't already
@@ -1799,6 +1824,7 @@ class SelfAttentionVHA(Attention):
                 attention_bias=attention_bias,
                 packed_seq_params=packed_seq_params,
                 use_rr_flash_attention=self.use_rr_flash_attention,
+                **cp_kwargs,
             )
         else:
             # Static batching attention kernel.
@@ -1816,6 +1842,7 @@ class SelfAttentionVHA(Attention):
                 past_key_values=past_key_values,
                 layer_idx=layer_idx,
                 use_cache=use_cache,
+                **cp_kwargs,
             )
 
         # apply reverse rope

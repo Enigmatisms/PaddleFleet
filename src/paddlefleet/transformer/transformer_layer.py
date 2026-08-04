@@ -32,6 +32,7 @@ from paddle.distributed.fleet.meta_parallel import (
 from paddle.distributed.fleet.utils import recompute
 from paddlefleet_ops import is_deep_ep_available
 
+from paddlefleet.attention_meta_info import AttentionMetaInfo
 from paddlefleet.parallel_state import (
     get_context_parallel_world_size,
 )
@@ -577,6 +578,7 @@ class TransformerLayer(nn.Layer):
         packed_seq_params: PackedSeqParams | None = None,
         input_ids: Tensor | None = None,
         origin_input_ids: Tensor | None = None,
+        cp_balance_buckets: Tensor | None = None,
         blocks: list | None = None,
     ):
         """Forward with block_attention_residuals + full_recompute.
@@ -653,6 +655,7 @@ class TransformerLayer(nn.Layer):
                 block_attention_residuals=True,
                 in_recompute=True,
                 input_ids=input_ids,
+                cp_balance_buckets=cp_balance_buckets,
             )
             if ctx is None:
                 return hs
@@ -688,6 +691,7 @@ class TransformerLayer(nn.Layer):
                 block_attention_residuals=True,
                 input_ids=input_ids,
                 origin_input_ids=origin_input_ids,
+                cp_balance_buckets=cp_balance_buckets,
             )
 
         mlp_out = recompute(_recompute_mlp, hidden_states)
@@ -894,6 +898,7 @@ class TransformerLayer(nn.Layer):
             input_ids = dict_args.get("input_ids", None)
             offload_kwargs = self._compute_act_offload_kwargs()
             origin_input_ids = dict_args.get("origin_input_ids", None)
+            cp_balance_buckets = dict_args.get("cp_balance_buckets", None)
 
             if (
                 self.config.block_attention_residuals
@@ -920,6 +925,7 @@ class TransformerLayer(nn.Layer):
                     packed_seq_params=packed_seq_params,
                     input_ids=input_ids,
                     origin_input_ids=origin_input_ids,
+                    cp_balance_buckets=cp_balance_buckets,
                     blocks=dict_args.get("blocks", []),
                 )
             else:
@@ -957,6 +963,7 @@ class TransformerLayer(nn.Layer):
                     packed_seq_params=packed_seq_params,
                     input_ids=input_ids,
                     origin_input_ids=origin_input_ids,
+                    cp_balance_buckets=cp_balance_buckets,
                     **offload_kwargs,
                 )
         else:
@@ -1143,6 +1150,7 @@ class TransformerLayer(nn.Layer):
                     block_attention_residuals=True,
                     input_ids=input_ids,
                     origin_input_ids=origin_input_ids,
+                    cp_balance_buckets=kwargs.get("cp_balance_buckets"),
                 )
 
             # Accumulate mlp output into partial_block
@@ -1178,6 +1186,7 @@ class TransformerLayer(nn.Layer):
                     hidden_states,
                     input_ids=input_ids,
                     origin_input_ids=origin_input_ids,
+                    cp_balance_buckets=kwargs.get("cp_balance_buckets"),
                 )
             self._log_md5(output, "layer_output", self.layer_number)
         if context is not None:
@@ -1236,6 +1245,15 @@ class TransformerLayer(nn.Layer):
 
         # Residual connection.
         residual = hidden_states
+
+        # Pack the balanceq chunk assignment onto the mask so the attention
+        # modules can pick it up without a new transport parameter.
+        cp_balance_buckets = kwargs.get("cp_balance_buckets")
+        if cp_balance_buckets is not None:
+            attn_mask_startend_row_indices = AttentionMetaInfo(
+                startend_row_indices=attn_mask_startend_row_indices,
+                cp_balance_buckets=cp_balance_buckets,
+            )
 
         # Optional Input Layer norm
         if self.recompute_input_layernorm:
@@ -1375,6 +1393,7 @@ class TransformerLayer(nn.Layer):
         Returns:
             output (Tensor): Transformed hidden states of shape [s, b, h].
         """
+        cp_balance_buckets = kwargs.get("cp_balance_buckets")
 
         # Residual connection.
         residual = hidden_states
@@ -1413,6 +1432,7 @@ class TransformerLayer(nn.Layer):
                         post_attention_layernorm_output,
                         input_ids=_mlp_input_ids,
                         origin_input_ids=_mlp_origin_input_ids,
+                        cp_balance_buckets=cp_balance_buckets,
                     )
                 else:
                     mlp_output, bias = self.mlp(post_attention_layernorm_output)
@@ -1437,6 +1457,7 @@ class TransformerLayer(nn.Layer):
                     post_attention_layernorm_output,
                     input_ids=input_ids,
                     origin_input_ids=origin_input_ids,
+                    cp_balance_buckets=cp_balance_buckets,
                 )
             else:
                 mlp_output_with_bias = self.mlp(post_attention_layernorm_output)
@@ -1663,6 +1684,13 @@ class HyperConnectionTransformerLayer(TransformerLayer):
         **kwargs,
     ):
         """mHC attention forward: aggregate → layernorm → attention → fused_h_res_h_post_bda."""
+        cp_balance_buckets = kwargs.get("cp_balance_buckets")
+        if cp_balance_buckets is not None:
+            attn_mask_startend_row_indices = AttentionMetaInfo(
+                startend_row_indices=attn_mask_startend_row_indices,
+                cp_balance_buckets=cp_balance_buckets,
+            )
+
         # Save n-stream residual for H_res mixing
         original_residual = hidden_states
         ori_dtype = hidden_states.dtype
@@ -1794,6 +1822,7 @@ class HyperConnectionTransformerLayer(TransformerLayer):
         **kwargs,
     ):
         """mHC MLP forward: aggregate → layernorm → MLP → fused_h_res_h_post_bda."""
+        cp_balance_buckets = kwargs.get("cp_balance_buckets")
         # Save n-stream residual for H_res mixing
         original_residual = hidden_states
         ori_dtype = hidden_states.dtype
@@ -1840,6 +1869,7 @@ class HyperConnectionTransformerLayer(TransformerLayer):
                     mlp_output, bias = self.mlp(
                         post_attention_layernorm_output,
                         input_ids=_mlp_input_ids,
+                        cp_balance_buckets=cp_balance_buckets,
                     )
                 else:
                     mlp_output, bias = self.mlp(post_attention_layernorm_output)
@@ -1857,7 +1887,9 @@ class HyperConnectionTransformerLayer(TransformerLayer):
         else:
             if isinstance(self.mlp, MoELayer) and input_ids is not None:
                 mlp_output_with_bias = self.mlp(
-                    post_attention_layernorm_output, input_ids=input_ids
+                    post_attention_layernorm_output,
+                    input_ids=input_ids,
+                    cp_balance_buckets=cp_balance_buckets,
                 )
             else:
                 mlp_output_with_bias = self.mlp(post_attention_layernorm_output)

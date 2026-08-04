@@ -234,7 +234,15 @@ class LanguageLoss(FleetLayer):
         )
         self.use_subbatch = self.loss_subbatch_sequence_length > 0
 
-    def forward_impl(self, logits: Tensor | tuple, labels: Tensor) -> Tensor:
+    def forward_impl(
+        self,
+        logits: Tensor | tuple,
+        labels: Tensor,
+        cp_balance_buckets: Tensor | None = None,
+    ) -> Tensor:
+        """cp_balance_buckets: default to None.
+        Used when cp_balance_mode starts with 'balanceq'.
+        """
         # Fused linear + cross-entropy path: `logits` is actually a
         # (hidden_states, weight, bias) tuple emitted by GPTLMHead when
         # config.fused_linear_ce_loss_chunk > 0. Dispatch to the fused kernel
@@ -281,10 +289,16 @@ class LanguageLoss(FleetLayer):
 
             if get_context_parallel_world_size() > 1:
                 loss = ContextParallelGatherOp.apply(
-                    loss, axis=1, mode=self.config.cp_balance_mode
+                    loss,
+                    axis=1,
+                    mode=self.config.cp_balance_mode,
+                    buckets=cp_balance_buckets,
                 )
                 labels = ContextParallelGatherOp.apply(
-                    labels, axis=1, mode=self.config.cp_balance_mode
+                    labels,
+                    axis=1,
+                    mode=self.config.cp_balance_mode,
+                    buckets=cp_balance_buckets,
                 )
 
             lossmask = labels != self.ignored_index
@@ -348,10 +362,16 @@ class LanguageLoss(FleetLayer):
 
         if get_context_parallel_world_size() > 1:
             loss = ContextParallelGatherOp.apply(
-                loss, axis=1, mode=self.config.cp_balance_mode
+                loss,
+                axis=1,
+                mode=self.config.cp_balance_mode,
+                buckets=cp_balance_buckets,
             )
             labels = ContextParallelGatherOp.apply(
-                labels, axis=1, mode=self.config.cp_balance_mode
+                labels,
+                axis=1,
+                mode=self.config.cp_balance_mode,
+                buckets=cp_balance_buckets,
             )
 
         if _use_accuracy_compatible_kernel():
@@ -455,23 +475,39 @@ class LanguageLoss(FleetLayer):
 
         return loss
 
-    def _forward(self, logits: Tensor | tuple, labels: Tensor):
+    def _forward(
+        self,
+        logits: Tensor | tuple,
+        labels: Tensor,
+        cp_balance_buckets: Tensor | None = None,
+    ):
         if (
             get_context_parallel_world_size() > 1
             and self.config.experimental_dataflow
         ):
             # In EB data flow and CP size > 1, scatter labels to cp local
             labels = ContextParallelScatterOp.apply(
-                labels, axis=1, mode=self.config.cp_balance_mode
+                labels,
+                axis=1,
+                mode=self.config.cp_balance_mode,
+                buckets=cp_balance_buckets,
             )
         if (
             self.config.recompute_modules is not None
             and "loss_fn" in self.config.recompute_modules
         ):
-            return recompute(self.forward_impl, logits, labels)
-        return self.forward_impl(logits, labels)
+            return recompute(
+                self.forward_impl, logits, labels, cp_balance_buckets
+            )
+        return self.forward_impl(logits, labels, cp_balance_buckets)
 
-    def forward(self, logits: Tensor | list, labels: Tensor) -> Tensor:
+    def forward(self, logits: Tensor | list | dict, labels: Tensor) -> Tensor:
+        cp_balance_buckets = None
+        if isinstance(logits, dict):
+            # GPTLMHead only wraps its output when balanceq needs to hand the
+            # chunk assignment over to the loss-side CP ops.
+            cp_balance_buckets = logits["cp_balance_buckets"]
+            logits = logits["logits"]
         if isinstance(logits, list):
             assert (
                 self.config.num_nextn_predict_layers is not None
@@ -490,7 +526,9 @@ class LanguageLoss(FleetLayer):
                 if self.config.train_mtp_only:
                     lm_loss = 0.0
                 else:
-                    lm_loss = self._forward(logits[0], lm_labels)
+                    lm_loss = self._forward(
+                        logits[0], lm_labels, cp_balance_buckets
+                    )
 
                 for depth in range(self.config.num_nextn_predict_layers):
                     logits_cur_depth = mtp_logits[depth]
@@ -509,12 +547,14 @@ class LanguageLoss(FleetLayer):
                                 labels_cur_depth,
                                 axis=1,
                                 mode=self.config.cp_balance_mode,
+                                buckets=cp_balance_buckets,
                             )
 
                         if self.config.fused_linear_ce_loss_chunk > 0:
                             loss_matrix_cur_depth = self._forward(
                                 logits_cur_depth,
                                 labels_cur_depth,
+                                cp_balance_buckets,
                             )
                         else:
                             if (
@@ -540,12 +580,14 @@ class LanguageLoss(FleetLayer):
                                     loss_matrix_cur_depth,
                                     axis=1,
                                     mode=self.config.cp_balance_mode,
+                                    buckets=cp_balance_buckets,
                                 )
                             )
                             labels_cur_depth = ContextParallelGatherOp.apply(
                                 labels_cur_depth,
                                 axis=1,
                                 mode=self.config.cp_balance_mode,
+                                buckets=cp_balance_buckets,
                             )
 
                         lossmask_cur_depth = (
@@ -565,10 +607,13 @@ class LanguageLoss(FleetLayer):
                         loss_cur_depth = self._forward(
                             logits_cur_depth,
                             labels_cur_depth,
+                            cp_balance_buckets,
                         )
                     mtp_loss.append(loss_cur_depth)
             else:
-                lm_loss = self._forward(logits[0], lm_labels)
+                lm_loss = self._forward(
+                    logits[0], lm_labels, cp_balance_buckets
+                )
                 if get_tensor_model_parallel_world_size() > 1:
                     target_p_self_op_dist = DistributedSoftmaxOp.apply(
                         logits[0], axis=2
@@ -588,6 +633,7 @@ class LanguageLoss(FleetLayer):
                             target_p_self_op_dist,
                             axis=1,
                             mode=cp_balance_mode,
+                            buckets=cp_balance_buckets,
                         )
 
                 def padding(tensor, left=False, pad_len=1):
@@ -641,6 +687,7 @@ class LanguageLoss(FleetLayer):
                                     target_p,
                                     axis=1,
                                     mode=cp_balance_mode,
+                                    buckets=cp_balance_buckets,
                                 )
                         plogp = target_p * out_logp
 
@@ -651,6 +698,7 @@ class LanguageLoss(FleetLayer):
                                 lossmask,
                                 axis=1,
                                 mode=self.config.cp_balance_mode,
+                                buckets=cp_balance_buckets,
                             )
 
                         ploss = -paddle.sum(lossmask * plogp)
@@ -740,7 +788,7 @@ class LanguageLoss(FleetLayer):
 
             return loss
         else:
-            return self._forward(logits, labels)
+            return self._forward(logits, labels, cp_balance_buckets)
 
     def build_schedule_node(self):
         return ScheduleNode(self.forward, name="LanguageLoss")
@@ -769,6 +817,7 @@ class MainLanguageLoss(LanguageLoss):
 
         mtp_loss = dict_args["mtp_loss"]
         logits = dict_args["logits"]
+        cp_balance_buckets = dict_args.get("cp_balance_buckets", None)
 
         assert not self.config.mtp_distillation_loss, (
             "separate mtp head & loss don't support mtp_distillation_loss"
@@ -777,7 +826,7 @@ class MainLanguageLoss(LanguageLoss):
         if self.config.train_mtp_only:
             lm_loss = 0.0
         else:
-            lm_loss = self._forward(logits, lm_labels)
+            lm_loss = self._forward(logits, lm_labels, cp_balance_buckets)
 
         # Store detached MTP loss tensors into class-level tracker and global_training_logs.
         # Use .detach() instead of .item() to avoid GPU synchronization on every
@@ -854,6 +903,7 @@ class MTPLanguageLoss(LanguageLoss):
             "separate mtp head & loss don't support mtp_distillation_loss"
         )
 
+        cp_balance_buckets = dict_args.get("cp_balance_buckets", None)
         for depth in range(self.config.num_nextn_predict_layers):
             logits_cur_depth = mtp_logits[depth]
             labels_cur_depth = labels_ori[
@@ -862,6 +912,7 @@ class MTPLanguageLoss(LanguageLoss):
             loss_cur_depth = self._forward(
                 logits_cur_depth,
                 labels_cur_depth,
+                cp_balance_buckets,
             )
             mtp_loss.append(loss_cur_depth)
 

@@ -41,6 +41,107 @@ try:
 except (ImportError, AttributeError):
     _flash_mask_available = False
 
+try:
+    from flash_mask.cp_balance import (
+        balance_flashmask_input,
+        indices_rerank_cuda,
+        indices_to_chunks_cuda,
+    )
+except (ImportError, ModuleNotFoundError):
+    pass  # only required when cp_balance_mode is balanceq_allgather
+
+
+def is_cp_balanceq_mode(mode):
+    """Whether the CP sequence layout is FlashMask balanceq (load-balanced chunks)."""
+    return mode == "balanceq_allgather"
+
+
+def require_cp_balanceq_buckets(buckets):
+    """Fail fast when a balanceq CP op is reached without its chunk assignment."""
+    if buckets is None:
+        raise ValueError(
+            "cp_balance_buckets is required when cp_balance_mode uses balanceq."
+        )
+    return buckets
+
+
+def buckets_to_tensor(buckets, place=None):
+    """Convert ``balance_flashmask_input`` buckets to an int32 [cp_size, n] chunk-id tensor."""
+    if buckets is None:
+        return None
+    return paddle.to_tensor(
+        [[int(item[-1]) for item in bucket] for bucket in buckets],
+        dtype="int32",
+        place=place,
+    )
+
+
+def expand_cp_startend_row_indices_to_d2(startend_row_indices, seq_len):
+    """Canonicalize a FlashMask column mask to the D=2 layout required by CP.
+
+    A D=1 mask only carries the document end boundary; CP kernels additionally
+    need the per-row start boundary, which for a plain document mask is the row
+    index itself. A D=2 mask is already canonical and returned unchanged.
+    """
+    if startend_row_indices.shape[-1] == 2:
+        return startend_row_indices
+    if startend_row_indices.shape[-1] != 1:
+        raise ValueError(
+            "attn_mask_startend_row_indices.shape[-1] must be either 1 or 2, "
+            f"got {startend_row_indices.shape[-1]}."
+        )
+    b, k_heads, k_seqlen, _ = startend_row_indices.shape
+    append_indices = (
+        paddle.arange(seq_len, dtype=startend_row_indices.dtype)
+        .cuda()
+        .reshape([1, 1, seq_len, 1])
+    )
+    return paddle.concat(
+        [
+            startend_row_indices,
+            append_indices.expand([b, k_heads, k_seqlen, 1]),
+        ],
+        axis=-1,
+    )
+
+
+def build_cp_balanceq_mask(startend_row_indices, balance_chunk_size=2048):
+    """Balance a global FlashMask across CP ranks.
+
+    Returns this rank's localized mask together with the global chunk-to-rank
+    assignment that every other sequence-sharded tensor must follow.
+    """
+    group = fleet.get_hybrid_communicate_group().get_context_parallel_group()
+    startend_row_indices = expand_cp_startend_row_indices_to_d2(
+        startend_row_indices, startend_row_indices.shape[2]
+    )
+    local_mask, buckets = balance_flashmask_input(
+        startend_row_indices,
+        group.nranks,
+        group.rank,
+        balance_chunk_size=balance_chunk_size,
+        use_ipo=True,
+    )
+    return local_mask, buckets_to_tensor(
+        buckets, place=startend_row_indices.place
+    )
+
+
+def localize_cp_balanceq_mask(
+    startend_row_indices, buckets, balance_chunk_size=2048
+):
+    """Localize another global FlashMask (e.g. MTP) with an existing assignment."""
+    group = fleet.get_hybrid_communicate_group().get_context_parallel_group()
+    startend_row_indices = expand_cp_startend_row_indices_to_d2(
+        startend_row_indices, startend_row_indices.shape[2]
+    )
+    reranked = indices_rerank_cuda(
+        startend_row_indices, buckets.reshape([-1]), balance_chunk_size
+    )
+    return indices_to_chunks_cuda(
+        reranked, buckets[group.rank], balance_chunk_size
+    )
+
 
 def mark_context_parallel_parameter_disable_scale_grad(param_or_layer):
     """
@@ -488,6 +589,66 @@ def reduce_scatter_contiguous(input_tensor, axis, group=None):
         )
 
 
+# ===========================================================================
+# Balance-Q CP primitives (chunk -> rank assignment given by ``buckets``)
+# ===========================================================================
+
+
+def reorder_chunked_tensor(input_tensor, axis, chunk_ids, total_chunks):
+    """Split ``axis`` into ``total_chunks`` chunks and select ``chunk_ids`` of them."""
+    if axis < 0:
+        axis += input_tensor.ndim
+    shape = input_tensor.shape
+    assert shape[axis] % total_chunks == 0, (
+        f"Sequence length {shape[axis]} on axis {axis} is not divisible by "
+        f"the balanceq chunk count {total_chunks}."
+    )
+    chunk_size = shape[axis] // total_chunks
+    reordered = paddle.gather(
+        input_tensor.reshape(
+            [*shape[:axis], total_chunks, chunk_size, *shape[axis + 1 :]]
+        ),
+        chunk_ids,
+        axis=axis,
+    )
+    return reordered.reshape(
+        [*shape[:axis], chunk_ids.shape[0] * chunk_size, *shape[axis + 1 :]]
+    )
+
+
+def scatter_balanceq(input_tensor, group=None, axis=0, buckets=None):
+    """Select this rank's chunks of the global sequence as assigned by ``buckets``."""
+    if group is None:
+        hcg = fleet.get_hybrid_communicate_group()
+        group = hcg.get_context_parallel_group()
+    if group.nranks == 1:
+        return input_tensor.clone()
+    require_cp_balanceq_buckets(buckets)
+    return reorder_chunked_tensor(
+        input_tensor,
+        axis,
+        buckets[group.rank].astype("int64"),
+        buckets.shape[0] * buckets.shape[1],
+    )
+
+
+def all_gather_balanceq(input_tensor, group=None, axis=0, buckets=None):
+    """All-gather local chunks in rank order, then restore the global chunk order."""
+    if group is None:
+        hcg = fleet.get_hybrid_communicate_group()
+        group = hcg.get_context_parallel_group()
+    if group.nranks == 1:
+        return input_tensor.clone()
+    require_cp_balanceq_buckets(buckets)
+    rank_ordered = all_gather_contiguous(input_tensor, group=group, axis=axis)
+    return reorder_chunked_tensor(
+        rank_ordered,
+        axis,
+        paddle.argsort(buckets.reshape([-1]).astype("int64")),
+        buckets.shape[0] * buckets.shape[1],
+    )
+
+
 class ContextParallelScatterOp(PyLayer):
     """
     Context parallel scatter operation using PyLayer for automatic differentiation.
@@ -496,9 +657,12 @@ class ContextParallelScatterOp(PyLayer):
     """
 
     @staticmethod
-    def forward(ctx, input_tensor, axis=0, mode="dualchunk_allgather"):
+    def forward(
+        ctx, input_tensor, axis=0, mode="dualchunk_allgather", buckets=None
+    ):
         ctx.axis = axis
         ctx.mode = mode
+        ctx.buckets = buckets
         hcg = fleet.get_hybrid_communicate_group()
 
         assert hcg.get_context_parallel_world_size() > 1, (
@@ -511,6 +675,10 @@ class ContextParallelScatterOp(PyLayer):
 
         if mode.startswith("contiguous"):
             return scatter_contiguous(input_tensor, group=group, axis=axis)
+        if is_cp_balanceq_mode(mode):
+            return scatter_balanceq(
+                input_tensor, group=group, axis=axis, buckets=buckets
+            )
         return scatter_balance(input_tensor, axis=axis, group=group)
 
     @staticmethod
@@ -518,6 +686,13 @@ class ContextParallelScatterOp(PyLayer):
         if ctx.mode.startswith("contiguous"):
             return all_gather_contiguous(
                 grad_output, group=ctx.group, axis=ctx.axis
+            )
+        if is_cp_balanceq_mode(ctx.mode):
+            return all_gather_balanceq(
+                grad_output,
+                group=ctx.group,
+                axis=ctx.axis,
+                buckets=ctx.buckets,
             )
         return all_gather_balance(grad_output, axis=ctx.axis, group=ctx.group)
 
@@ -530,9 +705,12 @@ class ContextParallelGatherOp(PyLayer):
     """
 
     @staticmethod
-    def forward(ctx, input_tensor, axis=0, mode="dualchunk_allgather"):
+    def forward(
+        ctx, input_tensor, axis=0, mode="dualchunk_allgather", buckets=None
+    ):
         ctx.axis = axis
         ctx.mode = mode
+        ctx.buckets = buckets
         hcg = fleet.get_hybrid_communicate_group()
 
         assert hcg.get_context_parallel_world_size() > 1, (
@@ -545,6 +723,10 @@ class ContextParallelGatherOp(PyLayer):
 
         if mode.startswith("contiguous"):
             return all_gather_contiguous(input_tensor, group=group, axis=axis)
+        if is_cp_balanceq_mode(mode):
+            return all_gather_balanceq(
+                input_tensor, group=group, axis=axis, buckets=buckets
+            )
         return all_gather_balance(input_tensor, axis=axis, group=group)
 
     @staticmethod
@@ -552,6 +734,13 @@ class ContextParallelGatherOp(PyLayer):
         if ctx.mode.startswith("contiguous"):
             return scatter_contiguous(
                 grad_output, group=ctx.group, axis=ctx.axis
+            )
+        if is_cp_balanceq_mode(ctx.mode):
+            return scatter_balanceq(
+                grad_output,
+                group=ctx.group,
+                axis=ctx.axis,
+                buckets=ctx.buckets,
             )
         return scatter_balance(grad_output, axis=ctx.axis, group=ctx.group)
 
@@ -561,6 +750,10 @@ class ContextParallelAllGatherOp(PyLayer):
     Context parallel all-gather operation with gradient reduction.
     Forward: All-gather input tensor (balanced or contiguous based on mode)
     Backward: Reduce-scatter gradients (sum + scatter)
+
+    Under balanceq the gather is intentionally in rank order rather than the
+    original global sequence order; use ContextParallelGatherOp when the
+    consumer needs the global order restored.
     """
 
     @staticmethod
@@ -577,13 +770,13 @@ class ContextParallelAllGatherOp(PyLayer):
         group = hcg.get_context_parallel_group()
         ctx.group = group
 
-        if mode.startswith("contiguous"):
+        if mode.startswith("contiguous") or is_cp_balanceq_mode(mode):
             return all_gather_contiguous(input_tensor, group=group, axis=axis)
         return all_gather_balance(input_tensor, axis=axis, group=group)
 
     @staticmethod
     def backward(ctx, grad_output):
-        if ctx.mode.startswith("contiguous"):
+        if ctx.mode.startswith("contiguous") or is_cp_balanceq_mode(ctx.mode):
             return reduce_scatter_contiguous(
                 grad_output, axis=ctx.axis, group=ctx.group
             )
@@ -666,6 +859,7 @@ def cp_flashmask_allgatherkv_balance_forward(
     is_training,
     softmax_scale,
     mode: str = "dualchunk_allgather",
+    buckets=None,
 ):
     """
     Forward pass of context parallel flashmask attention with balanced all-gather strategy.
@@ -719,6 +913,12 @@ def cp_flashmask_allgatherkv_balance_forward(
             seq_blocksize=query.shape[1],
             max_seqlen_q=query.shape[1],
         )
+    elif is_cp_balanceq_mode(mode):
+        # The mask is already localized against the rank-ordered concatenation
+        # of local chunks, so gather K/V in rank order and keep indices as-is.
+        require_cp_balanceq_buckets(buckets)
+        key_gathered = all_gather_contiguous(key, axis=1, group=group)
+        value_gathered = all_gather_contiguous(value, axis=1, group=group)
     else:
         raise ValueError(f"Unsupported FlashMask context parallel mode: {mode}")
 
@@ -803,7 +1003,7 @@ def cp_flashmask_allgatherkv_balance_backward(
     if mode == "dualchunk_allgather":
         key_gathered = all_gather_balance(key, axis=1, group=group)
         value_gathered = all_gather_balance(value, axis=1, group=group)
-    elif mode == "contiguous_allgather":
+    elif mode == "contiguous_allgather" or is_cp_balanceq_mode(mode):
         key_gathered = all_gather_contiguous(key, axis=1, group=group)
         value_gathered = all_gather_contiguous(value, axis=1, group=group)
     else:
@@ -935,7 +1135,7 @@ def cp_flashmask_allgatherkv_balance_backward(
         value_grad = reduce_scatter_any_axis_balance(
             value_grad_gathered, axis=1, group=group
         )
-    elif mode == "contiguous_allgather":
+    elif mode == "contiguous_allgather" or is_cp_balanceq_mode(mode):
         key_grad = reduce_scatter_contiguous(
             key_grad_gathered, axis=1, group=group
         )
@@ -1087,6 +1287,7 @@ class FlashMaskContextParallel(PyLayer):
         learnable_sink=None,
         softmax_scale=None,
         mode="dualchunk_allgather",
+        buckets=None,
     ):
         """
         Forward pass of FlashMask attention with context parallelism.
@@ -1100,7 +1301,9 @@ class FlashMaskContextParallel(PyLayer):
             dropout (float): Dropout probability
             causal (bool): Whether to use causal attention
             training (bool): Whether in training mode
-            mode (str): Attention mode, supports "dualchunk_allgather" and "contiguous_allgather"
+            mode (str): Attention mode, supports "dualchunk_allgather",
+                "contiguous_allgather" and "balanceq_allgather"
+            buckets (paddle.Tensor, optional): balanceq chunk-to-rank assignment
         Returns:
             paddle.Tensor: Attention output
         Raises:
@@ -1126,11 +1329,14 @@ class FlashMaskContextParallel(PyLayer):
         group = hcg.get_context_parallel_group()
 
         # Validate query sequence length for DualChunkSwap strategy
-        assert query.shape[1] % 2 == 0, (
-            f"Query sequence length must be divisible by 2. "
-            f"FlashMaskContextParallel uses DualChunkSwap strategy for load balancing. "
-            f"Current query sequence length: {query.shape[1]}"
-        )
+        if is_cp_balanceq_mode(mode):
+            require_cp_balanceq_buckets(buckets)
+        else:
+            assert query.shape[1] % 2 == 0, (
+                f"Query sequence length must be divisible by 2. "
+                f"FlashMaskContextParallel uses DualChunkSwap strategy for load balancing. "
+                f"Current query sequence length: {query.shape[1]}"
+            )
 
         # Perform forward pass
         output, log_sum_exp, startend_row_indices, fa_version = (
@@ -1145,6 +1351,7 @@ class FlashMaskContextParallel(PyLayer):
                 training,
                 softmax_scale,
                 mode,
+                buckets,
             )
         )
 
@@ -1919,6 +2126,7 @@ def flashmask_attention_cp(
     softmax_scale=None,
     mode="dualchunk_allgather",
     window_size=None,
+    buckets=None,
 ):
     """
     FlashMask attention with context parallelism - public API.
@@ -1934,6 +2142,7 @@ def flashmask_attention_cp(
         causal (bool, optional): Whether to use causal attention. Defaults to False
         training (bool, optional): Whether in training mode. Defaults to True
         mode (str, optional): Attention mode. Defaults to "dualchunk_allgather"
+        buckets (paddle.Tensor, optional): balanceq chunk-to-rank assignment
     Returns:
         paddle.Tensor: Attention output with shape [batch, seq_len/n, num_heads, head_dim]
     Example:
@@ -1976,7 +2185,7 @@ def flashmask_attention_cp(
             mode,
             window_size,
         )
-    elif mode == "dualchunk_allgather":
+    elif mode == "dualchunk_allgather" or is_cp_balanceq_mode(mode):
         output = FlashMaskContextParallel.apply(
             query,
             key,
@@ -1989,6 +2198,7 @@ def flashmask_attention_cp(
             learnable_sink,
             softmax_scale,
             mode,
+            buckets,
         )
     elif mode == "contiguous_a2a":
         if fixed_seed_offset is not None:
