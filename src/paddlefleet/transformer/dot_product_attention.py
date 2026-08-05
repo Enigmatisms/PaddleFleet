@@ -704,6 +704,12 @@ class DotProductAttention(FleetLayer):
                             "Disable refined_recompute or use default softmax_scale."
                         )
                 extra_kwargs["mode"] = self.config.cp_balance_mode
+                if self.config.cp_overlap:
+                    assert not use_rr_flash_attention, (
+                        "Overlapped context parallel attention does not support "
+                        "refined recompute."
+                    )
+                    extra_kwargs["mode"] += "_overlap"
                 if self.config.cp_balance_mode == "contiguous_a2a":
                     if not self.config.multi_latent_attention:
                         raise NotImplementedError(
