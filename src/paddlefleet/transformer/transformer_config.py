@@ -741,6 +741,14 @@ class TransformerConfig(ModelParallelConfig):
     "dualchunk_allgather": balanced front+rear chunk splitting (default).
     "contiguous_allgather": simple rank-order contiguous slicing.
     "contiguous_a2a".
+    An optional "_overlap"/"_nonoverlap" suffix selects `cp_overlap`; it is
+    stripped from this field during post-init.
+    """
+
+    cp_overlap: bool = False
+    """Whether context parallel FlashMask attention overlaps the KV
+    communication inside the attention kernel. Normally set through the
+    "_overlap" suffix of `cp_balance_mode`.
     """
 
     ####################
@@ -2331,6 +2339,16 @@ class TransformerConfig(ModelParallelConfig):
                 )
             _warnings.warn(f"[MULTIMAX-CONFIG] multimax_modules={_multimax}")
 
+        # Split the optional overlap suffix off the layout name, so that every
+        # cp_balance_mode comparison keeps matching the plain layout. Configs
+        # written before the suffix existed carry no suffix and stay
+        # non-overlap.
+        for _suffix, _overlap in (("_overlap", True), ("_nonoverlap", False)):
+            if self.cp_balance_mode.endswith(_suffix):
+                self.cp_balance_mode = self.cp_balance_mode[: -len(_suffix)]
+                self.cp_overlap = _overlap
+                break
+
         if self.cp_balance_mode not in {
             "dualchunk_allgather",
             "contiguous_allgather",
@@ -2364,3 +2382,11 @@ class TransformerConfig(ModelParallelConfig):
                     "hybrid_mla_cp_mode can only be set in dsv4_hybrid with "
                     "-2 in csa_compress_ratios."
                 )
+        if self.cp_overlap and self.cp_balance_mode not in {
+            "dualchunk_allgather",
+            "contiguous_allgather",
+        }:
+            raise ValueError(
+                "Overlapped context parallel attention only supports "
+                f"cp_balance_mode='dualchunk_allgather' and 'contiguous_allgather', got {self.cp_balance_mode!r}."
+            )
