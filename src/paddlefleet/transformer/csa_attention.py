@@ -1643,12 +1643,13 @@ class Compressor(nn.Layer):
             kv, _ = self.linear_wkv(x)  # [b, sq, coff * head_dim]
             score, _ = self.linear_wgate(x)  # [b, sq, coff * head_dim]
 
+        cp_size = getattr(cp_group, "nranks", 1) if cp_group is not None else 1
+        cp_rank = cp_group.rank if cp_size > 1 else 0
+
         # CP: gather projected KV globally before pooling (Miles pattern).
-        # This lets the compressor pool across the full sequence while keeping
-        # communication cheap (projected dim << hidden_size).
         # After all-gather, kv/score are global and sq is updated to sq_global.
         # The rest of the compression logic is shared with the non-CP path.
-        if cp_group is not None and getattr(cp_group, "nranks", 1) > 1:
+        if cp_size > 1:
             kv = all_gather_cp(kv, dim=1, group=cp_group)
             score = all_gather_cp(score, dim=1, group=cp_group)
             b, sq, _ = kv.shape
@@ -1659,6 +1660,31 @@ class Compressor(nn.Layer):
             n_compressed = sq // ratio
             actual_n_compressed = docmask_meta.actual_n_compressed
             cutoff_gather_indices = docmask_meta.cutoff_gather_indices
+
+            # Without the overlap transform a compressed group only reads its own
+            # ``ratio`` cutoff tokens, so the groups can be split across CP ranks.
+            n_shard = (
+                (actual_n_compressed + cp_size - 1) // cp_size
+                if cp_size > 1 and not self.overlap
+                else 0
+            )
+            if n_shard:
+                start = cp_rank * n_shard * ratio
+                cutoff_gather_indices = cutoff_gather_indices[
+                    start : start + n_shard * ratio
+                ]
+                pad_len = n_shard * ratio - cutoff_gather_indices.shape[0]
+                if pad_len > 0:
+                    # Slots past the last real group; dropped after the gather.
+                    cutoff_gather_indices = paddle.concat(
+                        [
+                            cutoff_gather_indices,
+                            paddle.zeros(
+                                [pad_len], dtype=cutoff_gather_indices.dtype
+                            ),
+                        ]
+                    )
+                actual_n_compressed = n_shard
 
             # Pack only valid cutoff data contiguously (no padding)
             kv = paddle.gather(kv, cutoff_gather_indices, axis=1)
@@ -1695,6 +1721,14 @@ class Compressor(nn.Layer):
                 )
             else:
                 kv = self.norm(kv.cast(x.dtype))
+
+            if n_shard:
+                # Shards concatenate into the dense group order; the tail beyond
+                # the last real group is padding and is re-added below.
+                actual_n_compressed = docmask_meta.actual_n_compressed
+                kv = all_gather_cp(kv, dim=1, group=cp_group)[
+                    :, :actual_n_compressed
+                ]
 
             # Pad to n_compressed before RoPE
             if actual_n_compressed < n_compressed:
