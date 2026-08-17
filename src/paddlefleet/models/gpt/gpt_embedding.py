@@ -13,6 +13,7 @@
 # limitations under the License.
 from __future__ import annotations
 
+import os
 import warnings
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Literal
@@ -46,6 +47,28 @@ if TYPE_CHECKING:
 
     from paddlefleet.packed_seq_params import PackedSeqParams
     from paddlefleet.transformer.transformer_config import TransformerConfig
+
+
+# Debug knob, sampled once like the rest of the FlashMask env flags.
+MASK_WINDOW_SIZE = int(os.environ.get("MASK_WINDOW_SIZE", "0"))
+
+
+def force_sliding_window_mask(mask):
+    """Replace the dataset's FlashMask row bounds with a causal window.
+
+    ``mask[..., 0]`` is, per key column, the first query row at which that
+    column becomes masked, so a window of ``W`` makes column ``j`` die at row
+    ``j + W``. Only that vector is overwritten: ``mask[..., 1]`` exists in the
+    D=2 layout and carries an unrelated bound.
+    """
+    if MASK_WINDOW_SIZE <= 0 or mask is None:
+        return mask
+    seqlen = mask.shape[-2]
+    mask = mask.clone()
+    mask[..., 0] = paddle.clip(
+        paddle.arange(seqlen, dtype=mask.dtype) + MASK_WINDOW_SIZE, max=seqlen
+    )
+    return mask
 
 
 @dataclass
@@ -324,6 +347,9 @@ class GPTEmbedding(FleetLayer):
             attn_mask_startend_row_indices.to(device)
             if attn_mask_startend_row_indices is not None
             else None
+        )
+        attn_mask_startend_row_indices = force_sliding_window_mask(
+            attn_mask_startend_row_indices
         )
         deepstack_image_embeds = dict_args.get("deepstack_image_embeds", None)
         deepstack_video_embeds = dict_args.get("deepstack_video_embeds", None)
