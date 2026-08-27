@@ -285,6 +285,40 @@ class TransformerConfig(ModelParallelConfig):
     swa_vha_postmix_rank: int | None = None
     """VHA postmix rank for SWA layers. Defaults to swa_num_attention_heads // 4."""
 
+    gqa_mla_groups: int | None = None
+    """Number of KV heads for GQA-MLA (dense MLA path only). None disables it.
+
+    The K up-projection is absorbed into the query with one matrix per group, so
+    the kernel runs MQA on the unchanged MLA cache line -- head dim kv_lora_rank
+    + qk_rope_head_dim on the query and key sides, kv_lora_rank on the value
+    side, which FA4 takes at (576, 512). The V up-projection moves behind the
+    core attention."""
+
+    gqa_mla_v_head_dim: int | None = None
+    """Output width of the GQA-MLA value up-projection, default kv_lora_rank.
+    Unless gqa_mla_group_out_dim narrows it, the o_proj input width is
+    num_attention_heads * gqa_mla_v_head_dim."""
+
+    gqa_mla_share_v_up: bool = False
+    """Whether a group shares one GQA-MLA value up-projection -- which is what a
+    GQA value head is -- instead of one per query head. It saves parameters, not
+    matmuls (each head still up-projects its own weighted sum), and it does
+    contract the function class, since a group's heads then share the subspace
+    that gqa_mla_activation and the attention gate act in."""
+
+    gqa_mla_group_out_dim: int | None = None
+    """Per-group output width of the optional GQA-MLA grouped output projection.
+    None skips it. When set, each group's num_attention_heads // gqa_mla_groups
+    up-projected slots are mapped down to one slot of this width, making the
+    o_proj input gqa_mla_groups * gqa_mla_group_out_dim."""
+
+    gqa_mla_activation: str | None = None
+    """Name of a paddle.nn.functional pointwise op applied after the GQA-MLA
+    value up-projection, before any grouped output projection. With None the
+    attention gate is all that is left between them; being data-dependent it
+    still blocks the absorption that would otherwise make gqa_mla_v_head_dim >
+    kv_lora_rank pointless."""
+
     attention_value_scale: float | None = None
     """Scale factor applied to the value tensor before attention computation. If None, no scaling
     is applied. Used in architectures like MiMo that scale V for training stability."""

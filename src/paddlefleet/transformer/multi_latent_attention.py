@@ -406,6 +406,10 @@ class MultiLatentAttention(Attention):
             self.qk_rope_head_dim = config.qk_rope_head_dim
             self.v_head_dim = config.v_head_dim
             self.num_attention_heads = config.num_attention_heads
+        # GQA-MLA: query heads are grouped, and each group's K up-projection is
+        # relocated into the query while the V up-projection moves behind the
+        # core attention, so the kernel runs MQA on the plain MLA cache line.
+        self.gqa_mla_groups = config.gqa_mla_groups
         # MLA has no GQA: K/V are always re-materialized from the shared latent
         # with ``num_attention_heads`` heads -- ``kv_b_proj`` is sized
         # ``num_attention_heads * (qk_nope_head_dim + v_head_dim)`` and the core
@@ -429,7 +433,9 @@ class MultiLatentAttention(Attention):
                     f"({kv_heads}) must equal hybrid_mla_num_attention_heads "
                     f"({self.num_attention_heads})."
                 )
-        self.num_key_value_heads = self.num_attention_heads
+        self.num_key_value_heads = (
+            self.gqa_mla_groups or self.num_attention_heads
+        )
         tp_size = get_pg_size(self.pg_collection.tp)
         assert self.num_attention_heads % tp_size == 0
         assert self.num_key_value_heads % tp_size == 0
@@ -454,6 +460,15 @@ class MultiLatentAttention(Attention):
         ):
             self.qk_rope_head_dim = self.config.swa_qk_rope_head_dim
 
+        if self.gqa_mla_groups:
+            # What the core attention weights is the latent's content, and
+            # ``gqa_mla_v_up`` widens it afterwards. After both
+            # ``qk_rope_head_dim`` overrides above.
+            self.v_head_dim = self.kv_lora_rank
+            self.gqa_mla_v_head_dim = (
+                config.gqa_mla_v_head_dim or self.kv_lora_rank
+            )
+
         self.q_head_dim = self.qk_nope_head_dim + self.qk_rope_head_dim
         self.head_dim = self.q_head_dim
         self.query_projection_size = self.q_head_dim * self.num_attention_heads
@@ -462,6 +477,22 @@ class MultiLatentAttention(Attention):
         self.out_projection_size = self.v_head_dim * self.num_attention_heads
         self.hidden_size_per_attention_head = self.q_head_dim
         self.value_hidden_size_per_attention_head = self.v_head_dim
+        if self.gqa_mla_groups:
+            self.gqa_mla_share_v_up = config.gqa_mla_share_v_up
+            self.gqa_mla_group_out_dim = config.gqa_mla_group_out_dim
+            self.gqa_mla_act = (
+                getattr(paddle.nn.functional, config.gqa_mla_activation)
+                if config.gqa_mla_activation
+                else None
+            )
+            # ``o_proj`` and the gate take the per-head up-projections
+            # concatenated, or the group slots when the grouped output
+            # projection narrows them first.
+            self.out_projection_size = (
+                self.gqa_mla_group_out_dim * self.num_key_value_heads
+                if self.gqa_mla_group_out_dim
+                else self.gqa_mla_v_head_dim * self.num_attention_heads
+            )
 
         mscale = _yarn_get_mscale(
             self.config.rotary_scaling_factor, self.config.mscale_all_dim
@@ -490,6 +521,32 @@ class MultiLatentAttention(Attention):
         self.mqa_latent_split_kv_b = self.mqa_latent and getattr(
             config, "mqa_split_kv_b_proj", False
         )
+
+        if self.gqa_mla_groups:
+            # Each of these either bypasses the eager K/V construction GQA-MLA
+            # extends, needs the value half of ``kv_b_proj`` it removes, or (VHA
+            # postmix) mixes an axis whose head count it changes.
+            if (
+                is_dsv4_hybrid
+                or self.mqa_latent
+                or bool(self.config.apply_rope_fusion)
+                or getattr(config, "mla_use_nope", False)
+                or getattr(config, "enable_hy_sparse_attention", False)
+                or getattr(config, "use_vha_attention", False)
+            ):
+                raise ValueError(
+                    "gqa_mla_groups is supported on the dense MLA path only, "
+                    "not with dsv4_hybrid / latent MQA / apply_rope_fusion / "
+                    "mla_use_nope / hy_sparse attention / VHA."
+                )
+            assert self.num_attention_heads % self.gqa_mla_groups == 0
+        elif (
+            config.gqa_mla_v_head_dim
+            or config.gqa_mla_share_v_up
+            or config.gqa_mla_group_out_dim
+            or config.gqa_mla_activation
+        ):
+            raise ValueError("The other gqa_mla_* need gqa_mla_groups.")
 
         # ``apply_rope_fusion`` is a model-wide flag, but the fused MLA RoPE is
         # only applicable per (q, k) pair.  Latent MQA cannot use it because
@@ -571,7 +628,15 @@ class MultiLatentAttention(Attention):
             attention_type=self.attention_type,
             is_mtp_layer=self.is_mtp_layer,
             is_swa=self.is_swa,
-            softmax_scale=self._softmax_scale_arg,
+            # Absorption widens the query past ``q_head_dim`` while preserving
+            # the scores, so the MHA scale must be passed explicitly: the core
+            # attention forwards only a *custom* scale, and the kernel's own
+            # default is 1/sqrt(query width).
+            softmax_scale=(
+                self.softmax_scale
+                if self.gqa_mla_groups
+                else self._softmax_scale_arg
+            ),
             k_channels=self.q_head_dim,
             v_channels=self.v_head_dim,
             num_attention_heads=self.num_attention_heads,
@@ -800,6 +865,66 @@ class MultiLatentAttention(Attention):
                         "recompute_method must be 'first_n' or 'block'"
                     )
 
+    def _gqa_mla_expand_groups(self, w, rows, cols):
+        # A group-shared [groups, rows, cols] weight, expanded to the query heads
+        # it serves in group-major order pi(j, c) = j * gs + c -- the order
+        # ``_gqa_mla_value_up_proj`` folds back into groups. expand's backward
+        # sums a group's gradients, which is the shared-weight gradient.
+        n = self.num_attention_heads_per_partition
+        g = self.num_key_value_heads_per_partition
+        return (
+            w.reshape([g, rows, cols])
+            .unsqueeze(1)
+            .expand([g, n // g, rows, cols])
+            .reshape([n, rows, cols])
+        )
+
+    def _gqa_mla_value_up_proj(self, core_attn_out):
+        # [.., H_q_pp * v_head_dim] -> [.., H_q_pp * gqa_mla_v_head_dim], or
+        # [.., G_pp * gqa_mla_group_out_dim] with the grouped projection on.
+        from paddlefleet.triton_ops import fused_grouped_matmul
+
+        n = self.num_attention_heads_per_partition
+        dv = self.gqa_mla_v_head_dim
+        # Sharing saves parameters, not matmuls: each head still up-projects its
+        # own weighted sum.
+        w = (
+            self._gqa_mla_expand_groups(self.gqa_mla_v_up, dv, self.v_head_dim)
+            if self.gqa_mla_share_v_up
+            else self.gqa_mla_v_up.reshape([n, dv, self.v_head_dim])
+        )
+        o = fused_grouped_matmul(
+            core_attn_out.reshape(
+                [*core_attn_out.shape[:-1], n, self.v_head_dim]
+            ),
+            w,
+        )
+        if self.gqa_mla_act is not None:
+            o = self.gqa_mla_act(o)
+        if self.gqa_mla_group_out_dim:
+            # Group-major head order, so folding the head axis into groups is a
+            # plain reshape.
+            g = self.num_key_value_heads_per_partition
+            o = fused_grouped_matmul(
+                o.reshape([*o.shape[:-2], g, -1]),
+                self.gqa_mla_group_out.reshape(
+                    [g, self.gqa_mla_group_out_dim, -1]
+                ),
+            )
+        return o.flatten(-2)
+
+    def _gqa_mla_absorb_q(self, q_no_pe):
+        # q_nope . (W_k^T c) == (W_k q_nope) . c: only the contraction order
+        # changes, and the key is left as the single cached latent. Expanding the
+        # weight keeps this one strided-batched ``bmm`` on stride views, where a
+        # grouped ``bmm`` would have to materialise its exit reshape.
+        n = self.num_attention_heads_per_partition
+        dn = self.qk_nope_head_dim
+        r = self.kv_lora_rank
+        w = self._gqa_mla_expand_groups(self.gqa_mla_k_up, dn, r)
+        o = paddle.bmm(q_no_pe.reshape([-1, n, dn]).transpose([1, 0, 2]), w)
+        return o.transpose([1, 0, 2]).reshape([*q_no_pe.shape[:-2], n, r])
+
     def _apply_vha_postmix(self, attn_out, U=None, V=None):
         # attn_out: [b, sq, nh_pp * v_head_dim] (head space, pre-gate / pre output proj).
         # Fused dense M = I + V @ U^T, then a single [nh,nh] GEMM on the head
@@ -839,6 +964,11 @@ class MultiLatentAttention(Attention):
         kv_lora_rank = self.kv_lora_rank
         v_head_dim = self.v_head_dim
         num_heads = self.num_attention_heads_per_partition
+        # The V slice below would read the wrong columns rather than fail:
+        # GQA-MLA replaced it by ``gqa_mla_v_up`` behind the core attention.
+        assert not self.gqa_mla_groups, (
+            "the FD MLA decode kernel is not wired for gqa_mla_groups"
+        )
 
         # Split query into nope and rope parts
         q_nope = query[
@@ -1145,6 +1275,10 @@ class MultiLatentAttention(Attention):
         # =================
         # Output. [b, sq, h]
         # =================
+        # Before the transpose below, so its copy sees the narrow tensor.
+        if self.gqa_mla_groups:
+            core_attn_out = self._gqa_mla_value_up_proj(core_attn_out)
+
         if self.config.sequence_parallel:
             core_attn_out = core_attn_out.transpose([1, 0, 2]).contiguous()
 
@@ -1512,9 +1646,11 @@ class MLASelfAttention(MultiLatentAttention):
         # forward reads it, and it would never receive a gradient. Building it
         # anyway would double both the resident parameter bytes and the
         # checkpoint size for this projection, so it is not built at all.
+        # GQA-MLA drops it too: ``gqa_mla_k_up`` is the whole K side and
+        # ``gqa_mla_v_up`` the whole V side.
         self.kv_b_proj = (
             None
-            if self.mqa_latent_split_kv_b
+            if self.mqa_latent_split_kv_b or self.gqa_mla_groups
             else build_spec_layer(
                 sublayers_spec.kv_b_proj,
                 kv_lora_rank,
@@ -1578,6 +1714,42 @@ class MLASelfAttention(MultiLatentAttention):
             )
             self.config.init_method(self.v_b_proj)
 
+        if self.gqa_mla_groups:
+            heads = self.num_attention_heads_per_partition
+            groups = self.num_key_value_heads_per_partition
+            tp_size = get_pg_size(pg_collection.tp)
+
+            def gqa_mla_param(rows, cols):
+                # Logically [blocks, rows, cols], stored 2-D with the leading
+                # dims folded, exactly as ``v_b_proj`` above.
+                p = self.create_parameter(
+                    shape=[rows, cols],
+                    dtype=self.config.params_dtype,
+                    default_initializer=paddle.nn.initializer.Constant(0.0),
+                )
+                self.config.init_method(p)
+                p.is_distributed = tp_size > 1
+                return p
+
+            # Absorbed into the query in place of ``kv_b_proj``'s K half, one
+            # matrix per group.
+            self.gqa_mla_k_up = gqa_mla_param(
+                groups * self.qk_nope_head_dim, kv_lora_rank
+            )
+            # Its V half, moved behind the core attention: one matrix per query
+            # head, or per group when it is shared.
+            self.gqa_mla_v_up = gqa_mla_param(
+                (groups if self.gqa_mla_share_v_up else heads)
+                * self.gqa_mla_v_head_dim,
+                self.v_head_dim,
+            )
+            if self.gqa_mla_group_out_dim:
+                # Each group's up-projected head slots down to one slot.
+                self.gqa_mla_group_out = gqa_mla_param(
+                    groups * self.gqa_mla_group_out_dim,
+                    heads // groups * self.gqa_mla_v_head_dim,
+                )
+
         if q_lora_rank is not None:
             self.q_a_layernorm = build_spec_layer(
                 sublayers_spec.q_a_layernorm,
@@ -1607,6 +1779,7 @@ class MLASelfAttention(MultiLatentAttention):
         qk_nope = self.qk_nope_head_dim
         qk_rope = self.qk_rope_head_dim
         kv_lora = self.kv_lora_rank
+        gqa_groups = self.gqa_mla_groups
 
         specs = {}
         if hasattr(self, "q_b_proj"):
@@ -1647,20 +1820,44 @@ class MLASelfAttention(MultiLatentAttention):
             )
             # ``kv_b_proj`` gets no gradient in this mode -- orthogonalising it
             # would only burn a per-head Newton-Schulz every step.
-        else:
+        elif not gqa_groups:
             specs["kv_b_proj.weight"] = (
                 ortho_per_head,
                 {"heads": num_heads, "head_sizes": [qk_nope, self.v_head_dim]},
             )
+        if gqa_groups:
+            groups = self.num_key_value_heads_per_partition
+            # Same transposed per-block layout as ``v_b_proj``: one block per
+            # group, or per query head for an unshared ``gqa_mla_v_up``.
+            for name, heads in (
+                ("gqa_mla_k_up", groups),
+                (
+                    "gqa_mla_v_up",
+                    groups if self.gqa_mla_share_v_up else num_heads,
+                ),
+                ("gqa_mla_group_out", groups),
+            ):
+                if hasattr(self, name):
+                    specs[name] = (
+                        ortho_per_head,
+                        {"heads": heads, "axis": -2, "transposed": True},
+                    )
+        # ``o_proj`` and the gate see group slots when the grouped output
+        # projection is on, one slot per query head otherwise.
+        out_heads = (
+            self.num_key_value_heads_per_partition
+            if gqa_groups and self.gqa_mla_group_out_dim
+            else num_heads
+        )
         if getattr(self, "gate_proj", None) is not None:
-            specs["gate_proj.weight"] = (ortho_per_head, {"heads": num_heads})
+            specs["gate_proj.weight"] = (ortho_per_head, {"heads": out_heads})
         # MQA (subclass) runs a second gated branch for block-sparse attention.
         # sparse_gate_proj is built from gate_proj's in/out sizes, so it shares
         # the head-major column layout and needs the same per-head slicing.
         if getattr(self, "sparse_gate_proj", None) is not None:
             specs["sparse_gate_proj.weight"] = (
                 ortho_per_head,
-                {"heads": num_heads},
+                {"heads": out_heads},
             )
         return specs
 
@@ -1691,6 +1888,9 @@ class MLASelfAttention(MultiLatentAttention):
         assert hidden_states.ndim == 3, (
             f"hidden_states should be 3D, [b, s, n*h], got {hidden_states.ndim}D"
         )
+        # ``getattr`` like ``mqa_latent_split_kv_b`` below: this method also runs
+        # bound to the lightweight namespace the RoPE tests build.
+        gqa_groups = getattr(self, "gqa_mla_groups", None)
 
         # =========================================
         # Prepare RoPE and seqlen related params
@@ -1939,7 +2139,8 @@ class MLASelfAttention(MultiLatentAttention):
             # kv: [num_tokens, n * (qk_nope_head_dim + v_head_dim)]
             # Absorbed MQA never materialises the per-head K/V: ``kv_b_proj`` is
             # folded into q (K side) and into the attention output (V side).
-            if self.mqa_latent:
+            # GQA-MLA does the same with ``gqa_mla_k_up`` / ``gqa_mla_v_up``.
+            if self.mqa_latent or gqa_groups:
                 kv = None
             else:
                 kv, _ = self.kv_b_proj(kv_compressed)
@@ -2120,7 +2321,7 @@ class MLASelfAttention(MultiLatentAttention):
 
                 # k_no_pe: [num_tokens, n, qk_nope_head_dim]
                 # value: [num_tokens, n, v_head_dim]
-                if self.mqa_latent:
+                if kv is None:
                     k_no_pe, value = None, None
                 else:
                     k_no_pe, value = paddle.split(
@@ -2355,6 +2556,17 @@ class MLASelfAttention(MultiLatentAttention):
                             [kv_compressed.unsqueeze(-2), k_pos_emb], axis=-1
                         )
                     value = None
+                elif gqa_groups:
+                    # Same change of contraction order, with the group-shared
+                    # ``gqa_mla_k_up``; shapes as above. ``value`` is the key's
+                    # content half, aliased outside this closure.
+                    query = paddle.cat(
+                        [self._gqa_mla_absorb_q(q_no_pe), q_pos_emb], axis=-1
+                    )
+                    key = paddle.cat(
+                        [kv_compressed.unsqueeze(-2), k_pos_emb], axis=-1
+                    )
+                    value = None
                 else:
                     query = paddle.cat([q_no_pe, q_pos_emb], axis=-1)
 
@@ -2404,6 +2616,11 @@ class MLASelfAttention(MultiLatentAttention):
                 rotary_pos_sin,
                 position_ids,
             )
+
+        if gqa_groups:
+            # A view of the cache line's content half, taken outside the
+            # closure so the recompute wrapper neither discards nor rebuilds it.
+            value = kv_compressed.unsqueeze(-2)
 
         return query, key, value, q_compressed, kv_compressed, k_pos_emb
 
