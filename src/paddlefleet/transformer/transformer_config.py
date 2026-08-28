@@ -319,6 +319,19 @@ class TransformerConfig(ModelParallelConfig):
     still blocks the absorption that would otherwise make gqa_mla_v_head_dim >
     kv_lora_rank pointless."""
 
+    gqa_mla_head_mix: str | None = None
+    """Head-axis mixing of the GQA-MLA value up-projection output, using one
+    [num_attention_heads, gqa_mla_groups] matrix. None disables it.
+
+    "postmix": the VHA low-rank residual mixer (I + V U^T) over the H_q slots.
+    Keeps the o_proj input width and is identity at init.
+
+    "fuse": contract the H_q slots down to one slot per group, mixing across all
+    heads (unlike gqa_mla_group_out_dim, which is block-diagonal and dense). It
+    narrows the o_proj input to gqa_mla_groups * gqa_mla_v_head_dim, so it
+    removes far more parameters than it adds. Initialised to the within-group
+    average -- zero init is not an option, there is no residual around it."""
+
     attention_value_scale: float | None = None
     """Scale factor applied to the value tensor before attention computation. If None, no scaling
     is applied. Used in architectures like MiMo that scale V for training stability."""

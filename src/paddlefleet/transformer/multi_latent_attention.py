@@ -480,19 +480,20 @@ class MultiLatentAttention(Attention):
         if self.gqa_mla_groups:
             self.gqa_mla_share_v_up = config.gqa_mla_share_v_up
             self.gqa_mla_group_out_dim = config.gqa_mla_group_out_dim
+            self.gqa_mla_head_mix = config.gqa_mla_head_mix
             self.gqa_mla_act = (
                 getattr(paddle.nn.functional, config.gqa_mla_activation)
                 if config.gqa_mla_activation
                 else None
             )
             # ``o_proj`` and the gate take the per-head up-projections
-            # concatenated, or the group slots when the grouped output
-            # projection narrows them first.
+            # concatenated, or one slot per group when the grouped output
+            # projection or the ``fuse`` head mixing contracts them first.
             self.out_projection_size = (
-                self.gqa_mla_group_out_dim * self.num_key_value_heads
-                if self.gqa_mla_group_out_dim
-                else self.gqa_mla_v_head_dim * self.num_attention_heads
-            )
+                self.num_key_value_heads
+                if self.gqa_mla_group_out_dim or self.gqa_mla_head_mix == "fuse"
+                else self.num_attention_heads
+            ) * (self.gqa_mla_group_out_dim or self.gqa_mla_v_head_dim)
 
         mscale = _yarn_get_mscale(
             self.config.rotary_scaling_factor, self.config.mscale_all_dim
@@ -540,11 +541,23 @@ class MultiLatentAttention(Attention):
                     "mla_use_nope / hy_sparse attention / VHA."
                 )
             assert self.num_attention_heads % self.gqa_mla_groups == 0
+            if self.gqa_mla_head_mix not in (None, "postmix", "fuse"):
+                raise ValueError(
+                    "gqa_mla_head_mix must be None / 'postmix' / 'fuse', got "
+                    f"{self.gqa_mla_head_mix!r}."
+                )
+            if self.gqa_mla_head_mix and self.gqa_mla_group_out_dim:
+                # Both contract the slots ``gqa_mla_head_mix`` counts, so the
+                # head axis it mixes would no longer be the query heads.
+                raise ValueError(
+                    "gqa_mla_head_mix and gqa_mla_group_out_dim are exclusive."
+                )
         elif (
             config.gqa_mla_v_head_dim
             or config.gqa_mla_share_v_up
             or config.gqa_mla_group_out_dim
             or config.gqa_mla_activation
+            or config.gqa_mla_head_mix
         ):
             raise ValueError("The other gqa_mla_* need gqa_mla_groups.")
 
@@ -803,7 +816,13 @@ class MultiLatentAttention(Attention):
         # axis, applied to the attention output (head space) before the output
         # projection. Reuses use_vha_attention / vha_postmix_rank. Ungrouped only:
         # MLA/MQA have no grouped o_proj to fold a block-diagonal mixer into.
-        self.use_vha_postmix = getattr(config, "use_vha_attention", False)
+        # ``gqa_mla_head_mix="postmix"`` is this same mixer applied to the GQA-MLA
+        # up-projection output, so it reuses everything below (and the call site,
+        # the recompute wrapper and the muon handling) with rank = groups.
+        self.use_vha_postmix = getattr(config, "use_vha_attention", False) or (
+            self.gqa_mla_groups is not None
+            and self.gqa_mla_head_mix == "postmix"
+        )
         if self.use_vha_postmix:
             # Use an explicit ValueError (not assert): assertions are stripped
             # under `python -O`, which would silently let TP>1 mix only the
@@ -819,7 +838,11 @@ class MultiLatentAttention(Attention):
             )  # == num_attention_heads (TP=1)
             rank = getattr(config, "vha_postmix_rank", None)
             if rank is None:
-                rank = nh // 4
+                rank = (
+                    self.num_key_value_heads_per_partition
+                    if self.gqa_mla_groups
+                    else nh // 4
+                )
             rank = max(1, min(rank, nh))
             self.vha_postmix_rank = rank
             self.vha_postmix_U = self.create_parameter(
@@ -911,6 +934,12 @@ class MultiLatentAttention(Attention):
                     [g, self.gqa_mla_group_out_dim, -1]
                 ),
             )
+        elif self.gqa_mla_head_mix == "fuse":
+            # Contract the query heads into one slot per group, mixing across all
+            # of them. Here rather than after the transpose below: the head axis
+            # is already unflattened, and the narrowed tensor is what should be
+            # copied. ``postmix`` instead runs at the VHA call site in forward.
+            o = paddle.matmul(self.gqa_mla_head_mix_u, o, transpose_x=True)
         return o.flatten(-2)
 
     def _gqa_mla_absorb_q(self, q_no_pe):
@@ -935,7 +964,10 @@ class MultiLatentAttention(Attention):
         if V is None:
             V = self.vha_postmix_V
         b, sq = attn_out.shape[0], attn_out.shape[1]
-        nh, d = self.num_attention_heads_per_partition, self.v_head_dim
+        nh = self.num_attention_heads_per_partition
+        # From the tensor rather than ``v_head_dim``: identical on the dense path,
+        # and GQA-MLA hands over slots that are ``gqa_mla_v_head_dim`` wide.
+        d = attn_out.shape[-1] // nh
         mixed = attn_out.reshape([b * sq, nh, d])
         M = paddle.matmul(V, U, transpose_y=True)  # [nh,r]@[r,nh]->[nh,nh]
         M = M + paddle.eye(nh, dtype=M.dtype)
@@ -1749,6 +1781,19 @@ class MLASelfAttention(MultiLatentAttention):
                     groups * self.gqa_mla_group_out_dim,
                     heads // groups * self.gqa_mla_v_head_dim,
                 )
+            if self.gqa_mla_head_mix == "fuse":
+                # [heads, groups], row h one-hot on group h // group_size (the
+                # group-major order the up-projection uses) and scaled so it
+                # starts as the group's mean with the per-element RMS preserved.
+                gs = heads // groups
+                self.gqa_mla_head_mix_u = self.create_parameter(
+                    shape=[heads, groups],
+                    dtype=self.config.params_dtype,
+                    default_initializer=paddle.nn.initializer.Assign(
+                        paddle.eye(groups).repeat_interleave(gs, axis=0)
+                        * gs**-0.5
+                    ),
+                )
 
         if q_lora_rank is not None:
             self.q_a_layernorm = build_spec_layer(
@@ -1843,10 +1888,11 @@ class MLASelfAttention(MultiLatentAttention):
                         {"heads": heads, "axis": -2, "transposed": True},
                     )
         # ``o_proj`` and the gate see group slots when the grouped output
-        # projection is on, one slot per query head otherwise.
+        # projection or the ``fuse`` head mixing is on, one per query head else.
         out_heads = (
             self.num_key_value_heads_per_partition
-            if gqa_groups and self.gqa_mla_group_out_dim
+            if gqa_groups
+            and (self.gqa_mla_group_out_dim or self.gqa_mla_head_mix == "fuse")
             else num_heads
         )
         if getattr(self, "gate_proj", None) is not None:
