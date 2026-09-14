@@ -58,25 +58,7 @@ except (ImportError, AttributeError):
     OVERLAP_SUPPORTED = False
 
 
-HIERARCHICAL_TRUE = ("1", "true", "on", "yes")
 BLOCK_ORDER_CACHE = {}
-
-
-def hierarchical_gpus_per_node(cp_size):
-    """Node size of the hierarchical KV traversal, 0 if it is not in use.
-
-    Mirrors the kernel's own decision, so the mask order cannot disagree with the
-    buffer it produces: same parsing as ``OverlapFeatureFlags::parse_bool_env``,
-    same single-node fallback as ``hier_is_effective``. The kernel takes its node
-    size from the NCCL topology, which ``HIERARCHICAL_GPUS_PER_NODE`` must match.
-    """
-    if (
-        os.environ.get("FLASHMASK_USE_HIERARCHICAL", "").lower()
-        not in HIERARCHICAL_TRUE
-    ):
-        return 0
-    gpus_per_node = int(os.environ.get("HIERARCHICAL_GPUS_PER_NODE", "8"))
-    return gpus_per_node if cp_size > gpus_per_node else 0
 
 
 def traversal_rank(logical_pos, rank, cp_size, gpus_per_node):
@@ -117,7 +99,7 @@ def block_order(cp_size, rank, backward, mode):
     key = (cp_size, rank, backward, mode)
     index = BLOCK_ORDER_CACHE.get(key)
     if index is None:
-        gpus_per_node = hierarchical_gpus_per_node(cp_size)
+        gpus_per_node = 8 if cp_size > 8 else 0
         contiguous = mode == "contiguous_allgather_overlap"
         if backward:
             positions = range(cp_size)
@@ -178,6 +160,38 @@ def gathered_kv_order(mask, group, backward, mode):
     )
 
 
+def _require_contiguous_cp_ranks(group):
+    """Reject a multi-node (cp_size > 8) CP group whose ranks are not one
+    contiguous block: hierarchical traversal maps 8 consecutive ranks
+    """
+    if group.world_size <= 8:
+        return
+    ranks = group.ranks
+    # ``ranks`` is ascending and unique, so contiguity is just its span.
+    if ranks[-1] - ranks[0] != len(ranks) - 1:
+        raise ValueError(
+            "Hierarchical FlashMask context parallel assumes contiguous 8-GPU "
+            f"nodes, but the context-parallel group has strided ranks {ranks}."
+        )
+
+
+def _require_eight_gpu_node(cp_size):
+    """Overlap hardcodes 8 GPUs per node to match the backend's hierarchical
+    gather (its ``num_lsa_ranks``); reject topologies where that assumption
+    would desync the gathered-KV order and silently corrupt attention.
+    """
+    local = os.getenv("PADDLE_LOCAL_SIZE")
+    if local is None:
+        return  # No per-node signal: honor the documented 8-GPU node.
+    gpus_per_node = int(local)
+    if gpus_per_node != 8 and cp_size > min(8, gpus_per_node):
+        raise ValueError(
+            "Overlapped FlashMask context parallel supports 8 GPUs per node "
+            f"only, but PADDLE_LOCAL_SIZE={gpus_per_node}; its mask order "
+            "would diverge from the backend's num_lsa_ranks-based gather."
+        )
+
+
 class OverlappedFlashMaskContextParallel(PyLayer):
     """FlashMask CP attention over an in-kernel overlapped KV all-gather.
 
@@ -200,6 +214,8 @@ class OverlappedFlashMaskContextParallel(PyLayer):
     ):
         hcg = fleet.get_hybrid_communicate_group()
         group = hcg.get_context_parallel_group()
+        _require_contiguous_cp_ranks(group)
+        _require_eight_gpu_node(group.world_size)
         mask = localize_mask(startend_row_indices, query.shape[1], group, mode)
 
         output, log_sum_exp = _flash_attn_fwd(

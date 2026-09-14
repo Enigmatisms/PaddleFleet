@@ -117,6 +117,7 @@ def _stub_kernel(sink_grad=True):
         1, 4
     )
     with (
+        mock.patch.dict(os.environ, {"PADDLE_LOCAL_SIZE": "8"}),
         mock.patch.object(ocp, "OVERLAP_SUPPORTED", True, create=True),
         mock.patch.object(ocp, "_flash_attn_fwd", fwd, create=True),
         mock.patch.object(ocp, "_flash_attn_bwd", bwd, create=True),
@@ -356,39 +357,6 @@ class TestCpOverlapConfig(unittest.TestCase):
 
 
 class TestTraversal(unittest.TestCase):
-    def test_hierarchical_switch_follows_kernel_semantics(self):
-        # Unset, unrecognized and false-ish values leave the traversal circular;
-        # a single node does too, because the kernel falls back to it as well.
-        for value, cp_size, expected in (
-            (None, 8, 0),
-            ("", 8, 0),
-            ("0", 8, 0),
-            ("off", 8, 0),
-            ("maybe", 8, 0),
-            ("TRUE", 8, 0),
-            ("TRUE", 16, 8),
-            ("yes", 16, 8),
-        ):
-            environ = (
-                {} if value is None else {"FLASHMASK_USE_HIERARCHICAL": value}
-            )
-            with mock.patch.dict(os.environ, environ, clear=True):
-                self.assertEqual(
-                    ocp.hierarchical_gpus_per_node(cp_size), expected
-                )
-
-    def test_node_size_read_from_environment(self):
-        with mock.patch.dict(
-            os.environ,
-            {
-                "FLASHMASK_USE_HIERARCHICAL": "1",
-                "HIERARCHICAL_GPUS_PER_NODE": "4",
-            },
-        ):
-            self.assertEqual(ocp.hierarchical_gpus_per_node(8), 4)
-            # cp_size <= gpus_per_node is a single node, hence circular.
-            self.assertEqual(ocp.hierarchical_gpus_per_node(4), 0)
-
     def test_traversal_visits_every_rank_once_from_the_local_one(self):
         for cp_size, gpus_per_node in ((8, 0), (8, 2), (8, 4), (16, 8)):
             for rank in range(cp_size):
@@ -459,16 +427,9 @@ class TestGatheredKvOrder(unittest.TestCase):
             self._check(cp_size, DUALCHUNK)
 
     def test_dualchunk_hierarchical_matches_reference_pipeline(self):
-        for gpus_per_node, cp_size in ((2, 4), (2, 8), (4, 8), (8, 16)):
-            ocp.BLOCK_ORDER_CACHE.clear()
-            with mock.patch.dict(
-                os.environ,
-                {
-                    "FLASHMASK_USE_HIERARCHICAL": "true",
-                    "HIERARCHICAL_GPUS_PER_NODE": str(gpus_per_node),
-                },
-            ):
-                self._check(cp_size, DUALCHUNK, gpus_per_node)
+        # Hierarchical traversal is fixed to 8-GPU nodes, so it only engages
+        # once the mesh spans more than one node (cp_size > 8).
+        self._check(16, DUALCHUNK, gpus_per_node=8)
 
     def test_contiguous_matches_slice_oracle(self):
         for cp_size in (1, 2, 4, 8):
@@ -747,6 +708,49 @@ class TestDotProductAttentionOverlapSuffix(unittest.TestCase):
             self._dispatched_mode(
                 "dualchunk_allgather_overlap", use_rr_flash_attention=True
             )
+
+
+class TestContiguousRankGuard(unittest.TestCase):
+    class _RankGroup:
+        def __init__(self, ranks):
+            self.ranks = ranks
+            self.world_size = len(ranks)
+
+    def test_single_node_skips_the_check(self):
+        # cp_size <= 8 is circular, so strided ranks are irrelevant and allowed.
+        ocp._require_contiguous_cp_ranks(self._RankGroup(list(range(0, 16, 2))))
+
+    def test_contiguous_multinode_ranks_pass(self):
+        ocp._require_contiguous_cp_ranks(self._RankGroup(list(range(16))))
+        ocp._require_contiguous_cp_ranks(self._RankGroup(list(range(8, 24))))
+
+    def test_strided_multinode_ranks_rejected(self):
+        with self.assertRaises(ValueError):
+            ocp._require_contiguous_cp_ranks(
+                self._RankGroup(list(range(0, 32, 2)))
+            )
+
+
+class TestEightGpuNodeGuard(unittest.TestCase):
+    def _run(self, cp_size, env):
+        with mock.patch.dict(os.environ, env, clear=True):
+            ocp._require_eight_gpu_node(cp_size)
+
+    def test_eight_gpu_node_always_passes(self):
+        self._run(16, {"PADDLE_LOCAL_SIZE": "8"})
+
+    def test_single_node_passes_on_any_size(self):
+        # cp_size <= node size is circular on both sides, so it is allowed.
+        self._run(4, {"PADDLE_LOCAL_SIZE": "4"})
+
+    def test_no_topology_signal_is_not_rejected(self):
+        self._run(16, {})
+
+    def test_multinode_non_eight_is_rejected(self):
+        with self.assertRaises(ValueError):
+            self._run(8, {"PADDLE_LOCAL_SIZE": "4"})
+        with self.assertRaises(ValueError):
+            self._run(16, {"PADDLE_LOCAL_SIZE": "4"})
 
 
 if __name__ == "__main__":
