@@ -1050,11 +1050,11 @@ class TransformerConfig(ModelParallelConfig):
     "dualchunk_allgather": balanced front+rear chunk splitting (default).
     "contiguous_allgather": simple rank-order contiguous slicing.
     "contiguous_a2a".
-    An optional "_overlap"/"_nonoverlap" suffix selects `cp_overlap`; it is
+    An optional "_overlap"/"_nonoverlap" suffix selects `flashmask_cp_overlap`; it is
     stripped from this field during post-init.
     """
 
-    cp_overlap: bool = False
+    flashmask_cp_overlap: bool = False
     """Whether context parallel FlashMask attention overlaps the KV
     communication inside the attention kernel. Normally set through the
     "_overlap" suffix of `cp_balance_mode`.
@@ -3461,7 +3461,7 @@ class TransformerConfig(ModelParallelConfig):
         for _suffix, _overlap in (("_overlap", True), ("_nonoverlap", False)):
             if self.cp_balance_mode.endswith(_suffix):
                 self.cp_balance_mode = self.cp_balance_mode[: -len(_suffix)]
-                self.cp_overlap = _overlap
+                self.flashmask_cp_overlap = _overlap
                 break
 
         valid_cp_balance_modes = {
@@ -3687,7 +3687,7 @@ class TransformerConfig(ModelParallelConfig):
                 f"{self.flash_attn_fa3_backend!r}"
             )
         set_fa3_backend(self.flash_attn_fa3_backend)
-        if self.cp_overlap and self.cp_balance_mode not in {
+        if self.flashmask_cp_overlap and self.cp_balance_mode not in {
             "dualchunk_allgather",
             "contiguous_allgather",
         }:

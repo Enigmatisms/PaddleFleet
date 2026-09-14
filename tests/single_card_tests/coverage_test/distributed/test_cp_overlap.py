@@ -334,12 +334,12 @@ class TestCpOverlapConfig(unittest.TestCase):
             ):
                 config = _config(layout + suffix)
                 self.assertEqual(config.cp_balance_mode, layout)
-                self.assertEqual(config.cp_overlap, expected)
+                self.assertEqual(config.flashmask_cp_overlap, expected)
 
     def test_suffixless_mode_untouched(self):
         config = _config("contiguous_a2a")
         self.assertEqual(config.cp_balance_mode, "contiguous_a2a")
-        self.assertFalse(config.cp_overlap)
+        self.assertFalse(config.flashmask_cp_overlap)
 
     def test_overlap_requires_an_allgather_layout(self):
         # The suffix is stripped before the layout whitelist, so the layout
@@ -347,7 +347,7 @@ class TestCpOverlapConfig(unittest.TestCase):
         with self.assertRaises(ValueError):
             _config("contiguous_a2a_overlap")
         with self.assertRaises(ValueError):
-            _config("contiguous_a2a", cp_overlap=True)
+            _config("contiguous_a2a", flashmask_cp_overlap=True)
 
     def test_unrecognized_suffix_still_rejected(self):
         # Only the exact "_overlap"/"_nonoverlap" suffixes are recognized; a
@@ -647,7 +647,7 @@ class TestFlashmaskAttentionCpDispatch(unittest.TestCase):
 
 
 class TestDotProductAttentionOverlapSuffix(unittest.TestCase):
-    """cp_overlap is what puts the suffix back on for flashmask_attention_cp."""
+    """flashmask_cp_overlap is what puts the suffix back on for flashmask_attention_cp."""
 
     SEQLEN = 8
     CP_SIZE = 2
