@@ -256,9 +256,13 @@ class TestNeighbourWindowCP(unittest.TestCase):
         np.testing.assert_array_equal(grad.numpy(), expected.numpy())
 
 
-# 300 -> 2 groups, 212 -> 1 group: 3 real groups over 2 ranks, so the baseline
-# hits its padded shard and the P2P plan hits an owner run shorter than a shard.
-_DOCS, _RATIO = [300, 212], 128
+_RATIO = 128
+_SQ_LOCAL = 2 * _RATIO
+
+
+def _docs(cp_size):
+    sq_global = _SQ_LOCAL * cp_size
+    return [sq_global - 212, 212]
 
 
 class TestCompressorSwitch(unittest.TestCase):
@@ -272,10 +276,11 @@ class TestCompressorSwitch(unittest.TestCase):
     """
 
     def _run_switch(self, cp_compress_p2p, expect):
-        sq_global = sum(_DOCS)
+        docs = _docs(CP_SIZE)
+        sq_global = sum(docs)
         sq = sq_global // CP_SIZE
         hidden_size, head_dim = 64, 32
-        meta = _meta(_DOCS, _RATIO)
+        meta = _meta(docs, _RATIO)
 
         paddle.seed(2026)
         comp = _build(hidden_size, _RATIO, head_dim, cp_compress_p2p)
