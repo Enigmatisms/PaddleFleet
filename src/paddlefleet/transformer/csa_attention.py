@@ -466,6 +466,8 @@ class CSADocMaskMetadata:
     _compacted_attn_topk: dict | None = None
     # CP pooling plan; layer-independent like the above, so one build per batch.
     _cp_compress_plan: dict | None = None
+    # THD prefix sums for the fused compressor, same one-build-per-batch deal.
+    _fused_compress_plan: dict | None = None
 
     @classmethod
     def build(
@@ -740,6 +742,53 @@ class CSADocMaskMetadata:
             )
             plan = (local, perm)
             self._cp_compress_plan[(cp_size, cp_rank)] = plan
+        return plan
+
+    def fused_compress_plan(self, cp_size: int, cp_rank: int):
+        """Return this rank's ``(cu_seqlens, cu_seqlens_comp)`` for the fused compressor.
+
+        One segment per document, holding the blocks of that document whose start
+        lands in this rank's shard -- within a document they are spaced ``ratio``
+        apart, which is all the kernel's address arithmetic allows. Documents the
+        rank does not own contribute zero-block segments instead of being filtered
+        out, which keeps this to a handful of elementwise ops on ``[n_docs]`` with
+        no host round trip, and makes every token row the kernel does not pool land
+        in some segment's declared tail or in a zero-block segment, so the
+        backward can use zero-initialized gradient buffers.
+        """
+        if self._fused_compress_plan is None:
+            self._fused_compress_plan = {}
+        plan = self._fused_compress_plan.get((cp_size, cp_rank))
+        if plan is None:
+            ratio = self.ratio
+            sq_local = self.seqlen // cp_size
+            base = cp_rank * sq_local
+            # Local buffer: the whole sequence at cp_size 1, else the shard plus the
+            # ratio - 1 rows append_next_window borrows. Declared ends must stay
+            # inside it, or the backward's tail sweep would write past the tensor.
+            cap = self.seqlen if cp_size == 1 else sq_local + ratio - 1
+            doc_lens = self.doc_lens.astype("int64")
+            starts = paddle.cumsum(doc_lens) - doc_lens
+            # Blocks [lo, hi) of each document start inside the shard. Both divisions
+            # take a clipped, non-negative numerator so the sign convention of
+            # integer division cannot matter.
+            lo = (paddle.clip(base - starts, min=0) + ratio - 1) // ratio
+            hi = paddle.minimum(
+                doc_lens // ratio,
+                (paddle.clip(base + sq_local - starts, min=0) + ratio - 1) // ratio,
+            )
+            count = paddle.clip(hi - lo, min=0)
+            seg = paddle.where(
+                count > 0,
+                starts + lo * ratio - base,
+                paddle.clip(starts - base, 0, cap),
+            )
+            one = paddle.full([1], cap, dtype="int32")
+            plan = (
+                paddle.concat([seg.cast("int32"), one]),
+                paddle.concat([paddle.zeros_like(one), paddle.cumsum(count).cast("int32")]),
+            )
+            self._fused_compress_plan[(cp_size, cp_rank)] = plan
         return plan
 
     def get_compressed_causal_mask(self) -> Tensor:
@@ -1673,6 +1722,18 @@ class Compressor(nn.Layer):
         # the whole projected sequence. False keeps the all-gather baseline,
         # bit-for-bit.
         self.cp_compress_p2p = getattr(config, "cp_compress_p2p", False)
+        # Fused cuDNN pooling, restricted to the configuration whose eager maths it
+        # reproduces: own-block window at ratio 128, fp32 ``ape`` promotion, bf16
+        # pooling output feeding the norm.
+        self.fused_compressor = (
+            getattr(config, "csa_fused_compressor", False)
+            and not getattr(config, "csa_dense_mode", False)
+            and compress_ratio == 128
+            and not self.overlap
+            and head_dim in (128, 512)
+            and not _ACCURACY_COMPATIBLE_KERNEL
+            and not self.swa_high_precision_norm
+        )
 
     def muon_slice_specs(self, muon_configs):
         """Muon orthogonal-slice specs for the compressor (overlap/ratio-4 only).
@@ -1846,32 +1907,47 @@ class Compressor(nn.Layer):
                         )
                     actual_n_compressed = n_shard
 
-            # Pack only valid cutoff data contiguously (no padding)
-            kv = paddle.gather(kv, cutoff_gather_indices, axis=1)
-            score = paddle.gather(score, cutoff_gather_indices, axis=1)
+            if self.fused_compressor and kv.dtype == paddle.bfloat16:
+                from paddlefleet.cudnn_ops.compressor import csa_compressor_cudnn
 
-            # Reshape: [b, actual_n_compressed, ratio, coff * head_dim]
-            kv = kv.reshape([b, actual_n_compressed, ratio, -1])
-            score = score.reshape([b, actual_n_compressed, ratio, -1])
-
-            # APE: [ratio, coff * head_dim] -> [1, 1, ratio, coff * head_dim]
-            ape = self.ape.reshape([1, 1, ratio, -1])
-            ape = ape.cast(score.dtype) if _ACCURACY_COMPATIBLE_KERNEL else ape
-            score = score + ape
-
-            if self.overlap:
-                is_first = docmask_meta.compressed_is_first
-                kv = self._overlap_transform(
-                    kv, fill_value=0, is_first=is_first
+                cu_seqlens, cu_seqlens_comp = docmask_meta.fused_compress_plan(
+                    cp_size, cp_rank
                 )
-                score = self._overlap_transform(
-                    score, fill_value=float("-inf"), is_first=is_first
-                )
+                kv = csa_compressor_cudnn(
+                    kv.squeeze(0),
+                    score.squeeze(0),
+                    self.ape,
+                    cu_seqlens,
+                    cu_seqlens_comp,
+                    actual_n_compressed,
+                ).unsqueeze(0)
+            else:
+                # Pack only valid cutoff data contiguously (no padding)
+                kv = paddle.gather(kv, cutoff_gather_indices, axis=1)
+                score = paddle.gather(score, cutoff_gather_indices, axis=1)
 
-            # TODO: should we cast?
-            # Gated pooling: softmax over the pool_dim, weighted sum.
-            kv = (kv * F.softmax(score, axis=2)).sum(axis=2)
-            # kv: [b, actual_n_compressed, head_dim]
+                # Reshape: [b, actual_n_compressed, ratio, coff * head_dim]
+                kv = kv.reshape([b, actual_n_compressed, ratio, -1])
+                score = score.reshape([b, actual_n_compressed, ratio, -1])
+
+                # APE: [ratio, coff * head_dim] -> [1, 1, ratio, coff * head_dim]
+                ape = self.ape.reshape([1, 1, ratio, -1])
+                ape = ape.cast(score.dtype) if _ACCURACY_COMPATIBLE_KERNEL else ape
+                score = score + ape
+
+                if self.overlap:
+                    is_first = docmask_meta.compressed_is_first
+                    kv = self._overlap_transform(
+                        kv, fill_value=0, is_first=is_first
+                    )
+                    score = self._overlap_transform(
+                        score, fill_value=float("-inf"), is_first=is_first
+                    )
+
+                # TODO: should we cast?
+                # Gated pooling: softmax over the pool_dim, weighted sum.
+                kv = (kv * F.softmax(score, axis=2)).sum(axis=2)
+                # kv: [b, actual_n_compressed, head_dim]
 
             if self.swa_high_precision_norm:
                 kv = self.norm(

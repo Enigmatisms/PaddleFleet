@@ -1792,6 +1792,17 @@ class TransformerConfig(ModelParallelConfig):
       * "cudnn": cuDNN indexer top-k/forward path.
     """
 
+    csa_fused_compressor: bool = False
+    """Use the fused cuDNN kernel for the compressor's gated pooling.
+
+    Replaces gather / +ape / softmax / weighted-sum with
+    ``cudnn_ops/compressor``, addressed by two THD prefix sums instead of a gather
+    index table. Only HCA layers qualify (ratio 128, own-block window); every
+    other layer keeps the eager path. Not bit-identical to eager -- the kernel's
+    ratio=128 contract is a tolerance and dAPE is not run-to-run reproducible --
+    so it needs a convergence check rather than a tensor comparison.
+    """
+
     csa_sparse_attn_backend: str = "tilelang"
     """CSA sparse attention backend. Single switch selecting one of three
     implementations of the final sparse MQA attention.
@@ -1998,6 +2009,7 @@ class TransformerConfig(ModelParallelConfig):
         "csa_dense_mode": "csa_dense_mode",
         "csa_indexer_backend": "csa_indexer_backend",
         "csa_sparse_attn_backend": "csa_sparse_attn_backend",
+        "csa_fused_compressor": "csa_fused_compressor",
         "csa_share_docmask_meta": "csa_share_docmask_meta",
         "mqa_share_docmask_meta": "mqa_share_docmask_meta",
         "o_groups": "o_groups",
