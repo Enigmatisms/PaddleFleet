@@ -113,7 +113,7 @@ def _meta(doc_lens, ratio):
 
 
 class TestNeighbourWindowNonCollective(unittest.TestCase):
-    """The wrapper guards and the single-rank (``group is None``) zero-pad."""
+    """The wrapper guards on the single-process path."""
 
     def test_nonpositive_window_is_identity(self):
         x = paddle.randn([1, 8, 4], dtype=DTYPE)
@@ -126,17 +126,11 @@ class TestNeighbourWindowNonCollective(unittest.TestCase):
             with self.assertRaises(ValueError):
                 fn(x, 9, None)
 
-    def test_zero_pad_when_no_group(self):
+    def test_requires_cp_group(self):
         x = paddle.randn([1, 8, 4], dtype=DTYPE)
-        nxt = append_next_window(x, 3, None)
-        self.assertEqual(nxt.shape, [1, 11, 4])
-        np.testing.assert_array_equal(nxt[:, :8].numpy(), x.numpy())
-        np.testing.assert_array_equal(nxt[:, 8:].numpy(), np.zeros([1, 3, 4]))
-
-        prev = prepend_prev_window(x, 3, None)
-        self.assertEqual(prev.shape, [1, 11, 4])
-        np.testing.assert_array_equal(prev[:, 3:].numpy(), x.numpy())
-        np.testing.assert_array_equal(prev[:, :3].numpy(), np.zeros([1, 3, 4]))
+        for fn in (append_next_window, prepend_prev_window):
+            with self.assertRaises(ValueError):
+                fn(x, 3, None)
 
 
 class TestCpCompressPlan(unittest.TestCase):

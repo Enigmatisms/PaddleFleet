@@ -118,8 +118,10 @@ def _neighbour_window(x: Tensor, window: int, group, side: str) -> Tensor:
             "the window may not span more than one CP shard"
         )
     if group is None or group.nranks <= 1:
-        pad = paddle.zeros([x.shape[0], window, x.shape[2]], dtype=x.dtype)
-        return paddle.concat([pad, x] if side == "prev" else [x, pad], axis=1)
+        raise ValueError(
+            f"{side}-window requires a context-parallel group with nranks > 1, "
+            f"got {group!r}"
+        )
     return NeighbourWindow.apply(x, window, group, side)
 
 
