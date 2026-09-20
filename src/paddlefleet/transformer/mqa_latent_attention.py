@@ -772,6 +772,9 @@ class MQALatentAttention(FleetLayer):
         # one config value now means one kernel across both phases of the layer.
         backend = str(getattr(config, "csa_indexer_backend", "tilelang"))
         self.indexer_backend = "tilelang" if backend == "unfused" else backend
+        self.index_topk_backend = getattr(
+            config, "index_topk_backend", "paddle"
+        )
         # Backward kernel for the sparse MQA attention (dkv). cuDNN accumulates
         # dkv with atomics and is not run-to-run reproducible (bounded by
         # ``test_block_sparse_dsa_gradcheck.py::TestDeterminism``); "tilelang"
@@ -914,6 +917,8 @@ class MQALatentAttention(FleetLayer):
         q_zz = dualchunk_swap(q_idx.detach(), self.cp_group, axis=1)
         w_zz = dualchunk_swap(w_idx.detach(), self.cp_group, axis=1)
 
+        index_topk_backend = getattr(self, "index_topk_backend", "paddle")
+
         def _chunk(sl, chunk_id):
             return cudnn_indexer_topk_fwd(
                 q_zz[:, sl].contiguous(),
@@ -925,6 +930,7 @@ class MQALatentAttention(FleetLayer):
                 doc_lens=doc_lens_arg,
                 seq_offset=chunk_id * m,
                 return_topk_scores=need_loss,
+                index_topk_backend=index_topk_backend,
             )
 
         r_lo = _chunk(slice(0, m), lo)
@@ -2193,6 +2199,7 @@ class MQALatentAttention(FleetLayer):
                     doc_lens=doc_lens_arg,
                     seq_offset=position_offset,
                     return_topk_scores=need_loss,
+                    index_topk_backend=self.index_topk_backend,
                 )
             topk_indices = paddle.where(
                 row_empty, paddle.full_like(selected, -1), selected
