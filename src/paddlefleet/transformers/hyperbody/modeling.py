@@ -59,7 +59,10 @@ from paddle.distributed.fleet.meta_parallel import (
 )
 
 from paddlefleet.models.common.language_loss.language_loss import LanguageLoss
-from paddlefleet.models.gpt.gpt_layer_specs import get_gpt_spec
+from paddlefleet.models.gpt.gpt_layer_specs import (
+    get_gpt_decoder_layers_spec,
+    get_gpt_spec,
+)
 from paddlefleet.models.hyperbody import (
     get_hyperbody_decoder_layer_specs,
     get_hyperbody_encoder_layer_specs,
@@ -68,7 +71,7 @@ from paddlefleet.transformer.layer import FleetLayer
 
 from ...nn.pp_model import GeneralModelForCausalLMPipe
 from ..model_utils import PretrainedModel
-from .configuration import DECODER_VIEW_KEYS, HyperBodyConfig
+from .configuration import CONTEXT_TOKEN, DECODER_VIEW_KEYS, HyperBodyConfig
 from .providers import (
     HyperBodyDecoderModelProvider,
     HyperEncoderConfig,
@@ -84,6 +87,30 @@ __all__ = [
     "HyperBodyModelPipe",
     "HyperBodyPretrainedModel",
 ]
+
+
+def _dense_scalar_use_long_query(use_long_query):
+    """Reduce ``use_long_query`` to the single scalar the dense encoder path
+    supports.
+
+    The dense frontend builds one rectangular ``[B, n_ctx, H]`` block with a
+    single query table shared by every segment, so it cannot represent a mixed
+    per-segment selection. ``_infer_use_long_query`` may return a per-segment
+    ``list[bool]``; a non-empty list is always truthy, so treating it as a raw
+    bool would silently pick the long-query table for every segment. Accept a
+    list only if all entries agree (reduce to that scalar); reject a mixed list
+    (such packs must use the packed decoder path, ``hyperencoder_packed_decoder``).
+    """
+    if isinstance(use_long_query, (list, tuple)):
+        if len({bool(u) for u in use_long_query}) > 1:
+            raise ValueError(
+                "dense encoder path requires a homogeneous use_long_query; got "
+                f"a mixed per-segment list {list(use_long_query)}. Use the packed "
+                "decoder path (hyperencoder_packed_decoder=True) for mixed "
+                "short/long segments."
+            )
+        return bool(use_long_query[0]) if use_long_query else False
+    return bool(use_long_query)
 
 
 # ======================================================================= #
@@ -286,16 +313,67 @@ class HyperBodyEncoderFrontEnd(FleetLayer):
             return freqs[:, : seg_lens[0]]
         return paddle.concat([freqs[:, :L] for L in seg_lens], axis=1)
 
+    def _infer_use_long_query(self, input_ids, cu_seqlens):
+        short_q, long_q = self.config.hyperencoder_query_lengths
+        bounds = [int(x) for x in cu_seqlens.reshape([-1]).tolist()]
+        tokens = input_ids.reshape([-1])
+        flags = []
+        for start, end in zip(bounds[:-1], bounds[1:]):
+            query_count = int(
+                (tokens[start:end] == CONTEXT_TOKEN).astype("int32").sum()
+            )
+            if query_count == long_q:
+                flags.append(True)
+            elif query_count == short_q:
+                flags.append(False)
+            else:
+                raise ValueError(
+                    f"HyperBody segment has {query_count} context tokens; "
+                    f"expected short={short_q} or long={long_q}"
+                )
+        return flags
+
     def forward(self, dict_args):
         from paddlefleet.transformer.prefix_lm_mask import (
             build_dense_mask,
             prefix_lm_pad_len,
         )
+        from .mm_pack import unpack_hyperbody_mm
+
+        # Text-only short path: when a sample carries no image/audio/context, the
+        # encoder has nothing to encode. Skip the multimodal frontend and let the
+        # decoder run on pure text (the bridge emits image_embeds=None so the
+        # shared GPTEmbedding._merge_multimodal is a no-op). A tiny dummy tensor
+        # keeps the (fixed) encoder-trunk layers in the pipeline happy; their
+        # output is discarded by the bridge under the _hb_text_only flag.
+        def _all_none(x):
+            return x is None or (
+                isinstance(x, (list, tuple)) and all(e is None for e in x)
+            )
+
+        if (
+            dict_args.get("context_ids", None) is None
+            and _all_none(dict_args.get("image", None))
+            and _all_none(dict_args.get("audio", None))
+        ):
+            return self._forward_text_only(
+                dict_args, build_dense_mask, prefix_lm_pad_len
+            )
+
+        # The fleet pipeline micro-batch loader only passes Tensors; image/audio
+        # are packed as ragged Tensors upstream and restored in place to lists here.
+        unpack_hyperbody_mm(dict_args)
 
         context_ids = dict_args["context_ids"]
         image = dict_args.get("image", None)
         audio = dict_args.get("audio", None)
-        use_long_query = dict_args.get("use_long_query", False)
+        cu_seqlens = dict_args.get("cu_seqlens", None)
+        if cu_seqlens is not None:
+            use_long_query = self._infer_use_long_query(
+                dict_args["input_ids"], cu_seqlens
+            )
+        else:
+            use_long_query = dict_args.get("use_long_query", False)
         cu_seqlens_context = dict_args.get("cu_seqlens_context", None)
 
         context_embeds = self._build_context_embeds(
@@ -323,6 +401,32 @@ class HyperBodyEncoderFrontEnd(FleetLayer):
         out["_hb_dec_position_ids"] = dict_args.get("position_ids", None)
         return out
 
+    def _forward_text_only(
+        self, dict_args, build_dense_mask, prefix_lm_pad_len
+    ):
+        """No-multimodal path: run the encoder trunk on a 1-token dummy so the
+        fixed encoder layers stay well-fed, then carry the decoder-bound fields
+        through. The bridge drops the dummy (image_embeds=None) under the
+        ``_hb_text_only`` flag, so the decoder runs on pure text.
+        """
+        H = int(self.query_short.weight.shape[-1])
+        dtype = self.query_short.weight.dtype
+        dummy_ctx = paddle.zeros([1, 1, H], dtype=dtype)
+        if self.packed:
+            out = self._forward_packed(dummy_ctx, False)
+        else:
+            out = self._forward_dense(
+                dummy_ctx, False, build_dense_mask, prefix_lm_pad_len
+            )
+        out["_hb_text_only"] = True
+        out["_hb_dec_input_ids"] = dict_args["input_ids"]
+        out["_hb_dec_labels"] = dict_args.get("labels", None)
+        out["_hb_dec_attn_mask_startend_row_indices"] = dict_args.get(
+            "attn_mask_startend_row_indices", None
+        )
+        out["_hb_dec_position_ids"] = dict_args.get("position_ids", None)
+        return out
+
     def _forward_dense(
         self,
         context_embeds,
@@ -331,6 +435,12 @@ class HyperBodyEncoderFrontEnd(FleetLayer):
         prefix_lm_pad_len,
     ):
         # Non-SP [B,S,H] dense-mask path (dp backend).
+        # The dense layout uses ONE query table for all segments (rectangular
+        # [B, n_ctx, H]); ``_infer_use_long_query`` may hand us a per-segment
+        # ``list[bool]`` whose non-empty truthiness would silently pick the
+        # long-query table for every segment. Reduce to the scalar the dense
+        # layout supports (mixed lists are rejected -> use the packed path).
+        use_long_query = _dense_scalar_use_long_query(use_long_query)
         bs, n_context, _ = context_embeds.shape
         qw = (self.query_long if use_long_query else self.query_short).weight
         queries = qw.unsqueeze(0).expand([bs, -1, -1])
@@ -510,6 +620,21 @@ class HyperBodyEncoderBridge(FleetLayer):
         return projected
 
     def forward(self, dict_args):
+        # Text-only short path: encoder produced a discardable dummy; emit
+        # image_embeds=None so the decoder embedding's _merge_multimodal no-ops.
+        if dict_args.get("_hb_text_only", False):
+            return {
+                "input_ids": dict_args["_hb_dec_input_ids"],
+                "position_ids": dict_args.get("_hb_dec_position_ids", None),
+                "attention_mask": None,
+                "attn_mask_startend_row_indices": dict_args[
+                    "_hb_dec_attn_mask_startend_row_indices"
+                ],
+                "decoder_input": None,
+                "image_embeds": None,
+                "video_embeds": None,
+                "labels": dict_args["_hb_dec_labels"],
+            }
         layout = dict_args.get("_hb_packed", None)
         if layout is not None:
             image_embeds = self._forward_packed(dict_args, layout)
@@ -567,7 +692,9 @@ class HyperBodySublayersSpec:
     encoder_layers: list[LayerSpec] = field(default_factory=list)
     bridge: LayerSpec = None
     decoder_embedding: LayerSpec = None
+    mhc_expand: LayerSpec = None
     decoder_layers: list[LayerSpec] = field(default_factory=list)
+    mhc_contract: LayerSpec = None
     layer_norm: LayerSpec = None
     lm_head: LayerSpec = None
 
@@ -638,9 +765,20 @@ class HyperBodyUnifiedModel(PipelineLayer):
         self.add_sequential_layer(
             layers, LayerDesc(spec.decoder_embedding), "model"
         )
+        # hyper-connections expand (after embedding, before trunk); only when
+        # the decoder was built with enable_hyper_connections=True.
+        if spec.mhc_expand is not None:
+            self.add_sequential_layer(
+                layers, LayerDesc(spec.mhc_expand), "model.mhc_expand"
+            )
         for i, dec_layer in enumerate(spec.decoder_layers):
             self.add_sequential_layer(
                 layers, LayerDesc(dec_layer), f"model.layers.{i}"
+            )
+        # hyper-connections contract (after trunk, before final norm).
+        if spec.mhc_contract is not None:
+            self.add_sequential_layer(
+                layers, LayerDesc(spec.mhc_contract), "model.mhc_contract"
             )
         self.add_sequential_layer(layers, LayerDesc(spec.layer_norm), "model")
         self.add_sequential_layer(
@@ -730,19 +868,6 @@ class HyperBodyUnifiedModel(PipelineLayer):
 # View builders + top-level builder                                        #
 # ======================================================================= #
 def _build_decoder_view(config: HyperBodyConfig):
-    """Materialize the decoder GPTConfig view (bare-named fields) + multimodal.
-
-    LOSS-EQUIVALENCE MERGE: ``HyperBodyDecoderModelProvider.from_config`` consumes
-    ``namespace.__dict__`` directly (``register_attributes`` iterates it). Under
-    the nested config the top-level ``__dict__`` no longer carries the decoder
-    geometry (it lives in ``config.decoder_config``), so we reconstruct the exact
-    field set the previous flat config fed the provider: ``{top-level globals}``
-    (the routed llm_meta + fusion/parallelism/token-id switches, minus the two
-    sub-config OBJECTS) overlaid with ``{decoder_config geometry}`` pulled via the
-    explicit :data:`DECODER_VIEW_KEYS` allowlist. Geometry wins on key collisions,
-    so the merged namespace == the old flat config's decoder-relevant ``__dict__``
-    and the materialized view (hence loss) is bit-identical.
-    """
     import types
 
     merged = {
@@ -753,9 +878,24 @@ def _build_decoder_view(config: HyperBodyConfig):
     dec = config.decoder_config
     for key in DECODER_VIEW_KEYS:
         merged[key] = dec.__dict__[key]
+    # When first_k_dense_replace is set, feed the provider an int moe_layer_freq=1
+    # so __post_init__ builds the [0] + [1]*(L-1) dense-first table (first_k cannot
+    # coexist with a list moe_layer_freq). Otherwise layer 0 would be MoE instead of
+    # dense, diverging from the real ernie5_v2 architecture.
+    if merged.get("first_k_dense_replace"):
+        merged["moe_layer_freq"] = 1
     namespace = types.SimpleNamespace(**merged)
 
     view = HyperBodyDecoderModelProvider.from_config(namespace)
+    # The MLA core attention kernel is selected by _attn_implementation. HyperBodyConfig
+    # inherits HF PretrainedConfig's default "eager", whereas ernie5_v2(lite) uses
+    # "default" (fused/flash); the two differ by ~1e-5 on the same q/k/v and accumulate
+    # from the first MLA layer, breaking bit-exact forward parity with standalone lite.
+    # Drive it from config (yaml/json/kwargs), falling back to "default" (matching lite)
+    # so HF's "eager" default does not leak in.
+    view._attn_implementation = (
+        getattr(config, "_attn_implementation", None) or "default"
+    )
     view.multimodal_embedding = True
     view.image_token_id = config.image_token_id
     view.video_token_id = config.video_token_id
@@ -847,7 +987,9 @@ def _build_encoder_view(config: HyperBodyConfig, decoder_hidden: int):
         # turns it on, the decoder's moe_router allocates a learnable
         # ``routed_scaling_factor_param``. Not forwarding it here would leave the
         # encoder on a fixed scale while the decoder learns one -> silent divergence.
-        routed_scaling_factor_learnable=config.routed_scaling_factor_learnable,
+        routed_scaling_factor_learnable=getattr(
+            config.encoder_config, "routed_scaling_factor_learnable", False
+        ),
         # Recompute intent, clamped to the encoder's only supported mode (see above).
         recompute_granularity=enc_recompute_granularity,
     )
@@ -878,6 +1020,16 @@ def build_hyperbody_unified_model(
             "HyperBody unified model only supports PP=1 in this phase."
         )
 
+    from .configuration import (
+        HyperBodyDecoderConfig,
+        HyperBodyEncoderConfig,
+    )
+
+    if isinstance(getattr(config, "decoder_config", None), dict):
+        config.decoder_config = HyperBodyDecoderConfig(**config.decoder_config)
+    if isinstance(getattr(config, "encoder_config", None), dict):
+        config.encoder_config = HyperBodyEncoderConfig(**config.encoder_config)
+
     decoder_view = _build_decoder_view(config)
 
     # #4: mirror the standalone decoder's rejection guards (MTP /
@@ -889,7 +1041,10 @@ def build_hyperbody_unified_model(
     gpt_spec = get_gpt_spec(
         config=decoder_view,
         head_empty_layers_spec=[],
-        transformer_layers_spec=get_hyperbody_decoder_layer_specs(decoder_view),
+        # Use the SHARED gpt decoder-layers spec (not the hyperbody one, which
+        # raises on MLA / experimental_attention_variant / vha) so the decoder
+        # can be configured into the ernie5_v2 (dsv4_hybrid) architecture.
+        transformer_layers_spec=get_gpt_decoder_layers_spec(decoder_view),
         tail_empty_layers_spec=[],
         mtp_layers_spec=None,
         vocab_size=decoder_view.vocab_size,
@@ -919,7 +1074,9 @@ def build_hyperbody_unified_model(
         encoder_layers=enc_layer_specs,
         bridge=bridge_spec,
         decoder_embedding=dec_sub.embedding,
+        mhc_expand=dec_sub.mhc_expand,
         decoder_layers=dec_sub.transformer_layers,
+        mhc_contract=dec_sub.mhc_contract,
         layer_norm=dec_sub.layer_norm,
         lm_head=dec_sub.lm_head,
     )
@@ -1281,6 +1438,7 @@ class HyperBodyForConditionalGeneration(HyperBodyPretrainedModel):
             "labels": labels,
             "attn_mask_startend_row_indices": attn_mask_startend_row_indices,
             "position_ids": position_ids,
+            "cu_seqlens": cu_seqlens,
             "cu_seqlens_context": cu_seqlens_context,
         }
         out = self.pipe(input_dict)
