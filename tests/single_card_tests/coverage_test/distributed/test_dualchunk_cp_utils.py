@@ -234,7 +234,7 @@ class TestIndexerTopkDualChunk(unittest.TestCase):
 
     CP_RANK, CP_SIZE, S, TOPK = 1, 4, 8, 4
 
-    def _run(self, need_loss):
+    def _run(self, need_loss, **attrs):
         from paddlefleet.transformer.mqa_latent_attention import (
             MQALatentAttention,
         )
@@ -256,7 +256,7 @@ class TestIndexerTopkDualChunk(unittest.TestCase):
         w = paddle.arange(self.S).reshape([1, self.S, 1]).cast("float32")
         vr = paddle.arange(2 * self.S).reshape([1, self.S, 2]).cast("float32")
         fake = types.SimpleNamespace(
-            cp_rank=self.CP_RANK, cp_size=self.CP_SIZE, cp_group="grp"
+            cp_rank=self.CP_RANK, cp_size=self.CP_SIZE, cp_group="grp", **attrs
         )
 
         with (
@@ -323,6 +323,16 @@ class TestIndexerTopkDualChunk(unittest.TestCase):
             [float(v) for v in scores[0, :, 0]],
             [8, 9, 10, 11, 23, 22, 21, 20],
         )
+
+    def test_index_topk_backend_reaches_both_calls(self):
+        for attrs, want in (
+            ({}, "paddle"),
+            ({"index_topk_backend": "deep_select"}, "deep_select"),
+        ):
+            calls = self._run(False, **attrs)[0]
+            self.assertEqual(
+                [c[2]["index_topk_backend"] for c in calls], [want, want]
+            )
 
 
 class TestChunkValidRange(unittest.TestCase):
