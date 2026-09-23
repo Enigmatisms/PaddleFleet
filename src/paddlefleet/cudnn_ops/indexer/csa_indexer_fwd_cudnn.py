@@ -51,12 +51,12 @@ def _require_cudnn_frontend():
 
 
 def _require_deep_select():
-    """Import the optional Paddle DeepSelect package on first use."""
+    """Import DeepSelect from paddlefleet_ops on first use."""
     try:
-        import deep_select
+        from paddlefleet_ops import deep_select
     except (ImportError, RuntimeError) as error:
         raise ImportError(
-            "index_topk_backend='deep_select' requires a Paddle-built deep_select"
+            "index_topk_backend='deep_select' requires paddlefleet_ops built with DeepSelect"
         ) from error
     return deep_select
 
@@ -90,7 +90,7 @@ def _indexer_top_k_deep_select(input_values, seq_lens, top_k, return_val):
     values, indices = deep_select.topk(
         input_values,
         k,
-        # Consumers require paired values/indices, not value order. sorted=True
+        # Consumers require paired values/indices, not value order.
         sorted=False,
         end=end,
         indices_type=paddle.int32,
@@ -473,6 +473,11 @@ def _cudnn_indexer_topk_fwd_impl(
     return_topk_scores=False,
     index_topk_backend="paddle",
 ):
+    if index_topk_backend not in {"paddle", "deep_select"}:
+        raise ValueError(
+            f"index_topk_backend={index_topk_backend!r} is invalid; "
+            "expected 'paddle' or 'deep_select'"
+        )
     _validate_indexer_inputs(index_q, index_k_comp, weights)
     if int(topk_effective) <= 0:
         raise ValueError(
