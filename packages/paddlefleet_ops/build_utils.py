@@ -485,7 +485,11 @@ def get_libs():
                 name="DeepSelect",
                 source_rel_path="third_party/DeepSelect",
                 artifacts=[Artifact("deep_select", "deep_select")],
-                extra_env={"DEEP_SELECT_BUILD_FRAMEWORK": "paddle"},
+                extra_env={
+                    "DEEP_SELECT_BUILD_FRAMEWORK": "paddle",
+                    # Empty so Paddle keeps DeepSelect's own sm_100a/sm_103a gencodes.
+                    "PADDLE_CUDA_ARCH_LIST": "",
+                },
             )
         )
     if sys.version_info >= (3, 12):
