@@ -1612,7 +1612,7 @@ class TransformerConfig(ModelParallelConfig):
     by TransformerConfig.transform_rules.
     """
 
-    index_topk_backend: Literal["paddle", "deep_select"] = "paddle"
+    dsa_index_topk_backend: Literal["paddle", "deep_select"] = "paddle"
     """Top-k implementation for the sparse DSA indexer.
 
     One of ``{"paddle", "deep_select"}``. ``"paddle"`` is the default to
@@ -3011,9 +3011,9 @@ class TransformerConfig(ModelParallelConfig):
                     "inside the full-layer recompute."
                 )
 
-        if self.index_topk_backend not in {"paddle", "deep_select"}:
+        if self.dsa_index_topk_backend not in {"paddle", "deep_select"}:
             raise ValueError(
-                f"index_topk_backend={self.index_topk_backend!r} is invalid. "
+                f"dsa_index_topk_backend={self.dsa_index_topk_backend!r} is invalid. "
                 "Must be one of {'paddle', 'deep_select'}."
             )
 

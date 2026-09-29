@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""``index_topk_backend="deep_select"`` in ``csa_indexer_fwd_cudnn``.
+"""``dsa_index_topk_backend="deep_select"`` in ``csa_indexer_fwd_cudnn``.
 
 The ``*Contract`` classes replace ``deep_select`` with ``_FakeDeepSelect`` and
 run on any card: they pin what the wrapper passes to the kernel (row limits,
@@ -237,21 +237,23 @@ class TestDeepSelectLoading(unittest.TestCase):
 
     def test_unknown_backend_is_rejected(self):
         values = paddle.zeros([1, 4], dtype="float32")
-        with self.assertRaisesRegex(ValueError, "index_topk_backend='radix'"):
+        with self.assertRaisesRegex(
+            ValueError, "dsa_index_topk_backend='radix'"
+        ):
             indexer_mod._select_indexer_top_k(
                 values, paddle.to_tensor([4]), 2, False, "radix"
             )
         with patch.object(indexer_mod, "_validate_indexer_inputs") as validate:
             for doc_lens in (None, [4]):
                 with self.assertRaisesRegex(
-                    ValueError, "index_topk_backend='radix'"
+                    ValueError, "dsa_index_topk_backend='radix'"
                 ):
                     indexer_mod.cudnn_indexer_topk_fwd(
                         None,
                         None,
                         None,
                         doc_lens=doc_lens,
-                        index_topk_backend="radix",
+                        dsa_index_topk_backend="radix",
                     )
             validate.assert_not_called()
 
@@ -284,7 +286,7 @@ class TestDeepSelectIndexerFwdContract(_ContractCase):
             1,
             2,
             valid_range=valid_range,
-            index_topk_backend="deep_select",
+            dsa_index_topk_backend="deep_select",
             return_topk_scores=True,
         )
         self.assert_kernel_calls(True)
@@ -330,7 +332,7 @@ class TestDeepSelectIndexerFwdContract(_ContractCase):
                             ratio=1,
                             topk_effective=topk,
                             return_topk_scores=scores,
-                            index_topk_backend="deep_select",
+                            dsa_index_topk_backend="deep_select",
                         )
                         self.assertEqual(offsets, want_offsets)
                         self.assert_kernel_calls(scores)
@@ -376,7 +378,7 @@ class TestDeepSelectIndexerFwdContract(_ContractCase):
                     valid_range=valid_range,
                     doc_lens=[3, 2],
                     return_topk_scores=True,
-                    index_topk_backend=backend,
+                    dsa_index_topk_backend=backend,
                 )
                 dense.assert_not_called()
                 self.assertEqual(produced["max_k"], max_k)
@@ -505,7 +507,7 @@ class TestDeepSelectIndexerFwdKernel(unittest.TestCase):
                             ratio=self.RATIO,
                             topk_effective=topk,
                             return_topk_scores=True,
-                            index_topk_backend=backend,
+                            dsa_index_topk_backend=backend,
                             **kwargs,
                         )
                         for backend in ("paddle", "deep_select")

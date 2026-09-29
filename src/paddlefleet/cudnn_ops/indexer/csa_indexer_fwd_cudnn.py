@@ -56,7 +56,7 @@ def _require_deep_select():
         from paddlefleet_ops import deep_select
     except (ImportError, RuntimeError) as error:
         raise ImportError(
-            "index_topk_backend='deep_select' requires paddlefleet_ops built with DeepSelect"
+            "dsa_index_topk_backend='deep_select' requires paddlefleet_ops built with DeepSelect"
         ) from error
     return deep_select
 
@@ -108,17 +108,17 @@ def _indexer_top_k_deep_select(input_values, seq_lens, top_k, return_val):
 
 
 def _select_indexer_top_k(
-    input_values, seq_lens, top_k, return_val, index_topk_backend
+    input_values, seq_lens, top_k, return_val, topk_backend
 ):
     """Dispatch indexer top-k to the configured backend."""
-    if index_topk_backend == "paddle":
+    if topk_backend == "paddle":
         return _indexer_top_k_unfused(input_values, seq_lens, top_k, return_val)
-    if index_topk_backend == "deep_select":
+    if topk_backend == "deep_select":
         return _indexer_top_k_deep_select(
             input_values, seq_lens, top_k, return_val
         )
     raise ValueError(
-        f"index_topk_backend={index_topk_backend!r} is invalid; "
+        f"dsa_index_topk_backend={topk_backend!r} is invalid; "
         "expected 'paddle' or 'deep_select'"
     )
 
@@ -302,7 +302,7 @@ def cudnn_indexer_topk(
     topk,
     valid_range=None,
     seq_offset=0,
-    index_topk_backend="paddle",
+    dsa_index_topk_backend="paddle",
     return_topk_scores=False,
 ):
     """Select top-K indices using cuDNN TRT-LLM radix kernel (SM100).
@@ -316,7 +316,7 @@ def cudnn_indexer_topk(
             compressed-KV range ``[valid_start, valid_end)`` for document-mask
             (packed multi-document) training. ``None`` => causal-only mode
             (legacy single-document behavior, byte-for-byte unchanged).
-        index_topk_backend: ``"paddle"`` or ``"deep_select"``.
+        dsa_index_topk_backend: ``"paddle"`` or ``"deep_select"``.
         return_topk_scores: return scores directly when DeepSelect is selected.
 
     Returns:
@@ -330,10 +330,10 @@ def cudnn_indexer_topk(
     sq = int(sq)
     topk = int(topk)
     seq_offset = int(seq_offset)
-    if return_topk_scores and index_topk_backend != "deep_select":
+    if return_topk_scores and dsa_index_topk_backend != "deep_select":
         raise ValueError(
             "return_topk_scores is only supported with "
-            "index_topk_backend='deep_select'"
+            "dsa_index_topk_backend='deep_select'"
         )
     topk_k = min(topk, sk)
 
@@ -367,10 +367,12 @@ def cudnn_indexer_topk(
         seq_lens = counts.reshape([batch * sq]).cast("int32")
         valid_range_for_remap = valid_range
 
-    return_values = return_topk_scores and index_topk_backend == "deep_select"
+    return_values = (
+        return_topk_scores and dsa_index_topk_backend == "deep_select"
+    )
     topk_input = scores_for_topk.reshape([batch * sq, sk]).contiguous()
     result = _select_indexer_top_k(
-        topk_input, seq_lens, topk_k, return_values, index_topk_backend
+        topk_input, seq_lens, topk_k, return_values, dsa_index_topk_backend
     )
     topk_indices = result["indices"].reshape([batch, sq, topk_k])
     topk_scores = (
@@ -408,7 +410,7 @@ def cudnn_indexer_topk_fwd(
     doc_lens=None,
     seq_offset=0,
     return_topk_scores=False,
-    index_topk_backend="paddle",
+    dsa_index_topk_backend="paddle",
 ):
     """Run cuDNN-frontend DSA indexer forward on Paddle tensors.
 
@@ -434,7 +436,7 @@ def cudnn_indexer_topk_fwd(
         seq_offset: global query position offset for CP causal-only mode.
         return_topk_scores: return selected raw scores as a third output. This
             avoids gathering from a packed-global score tensor on the THD path.
-        index_topk_backend: top-k implementation, ``"paddle"`` or
+        dsa_index_topk_backend: top-k implementation, ``"paddle"`` or
             ``"deep_select"``.
 
     Returns:
@@ -455,7 +457,7 @@ def cudnn_indexer_topk_fwd(
         doc_lens=doc_lens,
         seq_offset=seq_offset,
         return_topk_scores=return_topk_scores,
-        index_topk_backend=index_topk_backend,
+        dsa_index_topk_backend=dsa_index_topk_backend,
     )
 
 
@@ -471,11 +473,11 @@ def _cudnn_indexer_topk_fwd_impl(
     doc_lens=None,
     seq_offset=0,
     return_topk_scores=False,
-    index_topk_backend="paddle",
+    dsa_index_topk_backend="paddle",
 ):
-    if index_topk_backend not in {"paddle", "deep_select"}:
+    if dsa_index_topk_backend not in {"paddle", "deep_select"}:
         raise ValueError(
-            f"index_topk_backend={index_topk_backend!r} is invalid; "
+            f"dsa_index_topk_backend={dsa_index_topk_backend!r} is invalid; "
             "expected 'paddle' or 'deep_select'"
         )
     _validate_indexer_inputs(index_q, index_k_comp, weights)
@@ -504,7 +506,7 @@ def _cudnn_indexer_topk_fwd_impl(
             seq_offset,
             doc_lens=doc_lens,
             return_topk_scores=return_topk_scores,
-            index_topk_backend=index_topk_backend,
+            dsa_index_topk_backend=dsa_index_topk_backend,
         )
         if thd_result is not None:
             return thd_result
@@ -524,7 +526,7 @@ def _cudnn_indexer_topk_fwd_impl(
             valid_range,
             seq_offset,
             return_topk_scores,
-            index_topk_backend,
+            dsa_index_topk_backend,
         )
 
     # Tile the query dimension: each tile's forward + top-k is independent of
@@ -546,7 +548,7 @@ def _cudnn_indexer_topk_fwd_impl(
             vr_chunk,
             seq_offset + start,
             return_topk_scores,
-            index_topk_backend,
+            dsa_index_topk_backend,
         )
         if return_topk_scores:
             idx_chunk, len_chunk, score_chunk = chunk
@@ -636,7 +638,7 @@ def _cudnn_indexer_topk_fwd_docmask_thd(
     seq_offset: int,
     doc_lens: list[int],
     return_topk_scores: bool = False,
-    index_topk_backend: str = "paddle",
+    dsa_index_topk_backend: str = "paddle",
 ):
     batch, seq_len, _, _ = index_q.shape
     if batch != 1:
@@ -659,7 +661,7 @@ def _cudnn_indexer_topk_fwd_docmask_thd(
     # Keep the cuDNN-produced score rows directly consumable by the selected
     # TopK backend, avoiding a full aligned copy before DeepSelect.
     align_elems = 4
-    if index_topk_backend == "deep_select":
+    if dsa_index_topk_backend == "deep_select":
         align_elems = _deep_select_alignment(paddle.float32)
     max_k = (max_k + align_elems - 1) // align_elems * align_elems
 
@@ -690,7 +692,7 @@ def _cudnn_indexer_topk_fwd_docmask_thd(
         counts.squeeze(0),
         topk_effective,
         return_topk_scores,
-        index_topk_backend,
+        dsa_index_topk_backend,
     )
 
     topk_global = topk_local_to_global(
@@ -714,7 +716,7 @@ def _dense_indexer_topk_single(
     valid_range,
     seq_offset,
     return_topk_scores,
-    index_topk_backend,
+    dsa_index_topk_backend,
 ):
     """Single-shot packed-global forward + top-k over the full query slice."""
     scores = cudnn_indexer_forward(
@@ -725,7 +727,7 @@ def _dense_indexer_topk_single(
         sm_scale=sm_scale,
         seq_offset=seq_offset,
     )
-    if index_topk_backend == "deep_select":
+    if dsa_index_topk_backend == "deep_select":
         topk_result = cudnn_indexer_topk(
             scores,
             int(index_q.shape[1]),
@@ -733,7 +735,7 @@ def _dense_indexer_topk_single(
             topk_effective,
             valid_range=valid_range,
             seq_offset=seq_offset,
-            index_topk_backend=index_topk_backend,
+            dsa_index_topk_backend=dsa_index_topk_backend,
             return_topk_scores=return_topk_scores,
         )
         if return_topk_scores:
